@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#080b12">
+  <title>Successful Pine Script</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+<header class="topbar">
+  <div>
+    <h1>SUCCESSFUL <span>PINE SCRIPT</span></h1>
+    <p>AI Trading Analysis Dashboard</p>
+  </div>
+
+  <div class="connection">
+    <span class="status-dot"></span>
+    <span id="connectionText">Demo Mode</span>
+  </div>
+</header>
+
+<main class="container">
+
+  <section class="control-panel">
+
+    <div class="control">
+      <label>Market</label>
+      <select id="market">
+        <option>XAUUSD</option>
+        <option>XAGUSD</option>
+        <option>EURUSD</option>
+        <option>GBPUSD</option>
+        <option>USDJPY</option>
+        <option>NAS100</option>
+        <option>US30</option>
+        <option>BTCUSD</option>
+      </select>
+    </div>
+
+    <div class="control">
+      <label>Timeframe</label>
+      <select id="timeframe">
+        <option>M5</option>
+        <option>M15</option>
+        <option>M30</option>
+        <option>H1</option>
+        <option>H4</option>
+        <option>Daily</option>
+      </select>
+    </div>
+
+    <button id="analyzeBtn" class="analyze-btn">
+      ANALYZE MARKET
+    </button>
+
+  </section>
+
+  <section class="market-card">
+
+    <div>
+      <span class="label">SELECTED MARKET</span>
+      <h2 id="selectedMarket">XAUUSD</h2>
+    </div>
+
+    <div class="price-box">
+      <span class="label">PRICE</span>
+      <strong id="price">--</strong>
+    </div>
+
+    <div>
+      <span class="label">TIMEFRAME</span>
+      <strong id="selectedTimeframe">M5</strong>
+    </div>
+
+  </section>
+
+
+  <section class="signal-card">
+
+    <div class="signal-header">
+      <div>
+        <span class="label">CURRENT SIGNAL</span>
+        <h2 id="signal">NO SETUP</h2>
+      </div>
+
+      <div id="grade" class="grade neutral">
+        WAIT
+      </div>
+    </div>
+
+    <div class="signal-grid">
+
+      <div>
+        <span>Direction</span>
+        <strong id="direction">Waiting</strong>
+      </div>
+
+      <div>
+        <span>Setup</span>
+        <strong id="setupType">None</strong>
+      </div>
+
+      <div>
+        <span>Confidence</span>
+        <strong id="confidence">0%</strong>
+      </div>
+
+      <div>
+        <span>Risk/Reward</span>
+        <strong id="rr">--</strong>
+      </div>
+
+    </div>
+
+  </section>
+
+
+  <section class="levels">
+
+    <h2>Trade Levels</h2>
+
+    <div class="level-grid">
+
+      <div class="level">
+        <span>ENTRY</span>
+        <strong id="entry">--</strong>
+      </div>
+
+      <div class="level">
+        <span>STOP LOSS</span>
+        <strong id="sl">--</strong>
+      </div>
+
+      <div class="level">
+        <span>TP1</span>
+        <strong id="tp1">--</strong>
+      </div>
+
+      <div class="level">
+        <span>TP2</span>
+        <strong id="tp2">--</strong>
+      </div>
+
+    </div>
+
+  </section>
+
+
+  <section class="analysis-grid">
+
+    <div class="analysis-card">
+
+      <h2>Market Structure</h2>
+
+      <div class="check">
+        <span>Swing Point</span>
+        <strong id="swing">Waiting</strong>
+      </div>
+
+      <div class="check">
+        <span>Structure</span>
+        <strong id="structure">Waiting</strong>
+      </div>
+
+      <div class="check">
+        <span>Liquidity</span>
+        <strong id="liquidity">Waiting</strong>
+      </div>
+
+      <div class="check">
+        <span>Support / Resistance</span>
+        <strong id="sr">Waiting</strong>
+      </div>
+
+    </div>
+
+
+    <div class="analysis-card">
+
+      <h2>Candlestick Confirmation</h2>
+
+      <div class="check">
+        <span>Candle Pattern</span>
+        <strong id="candle">Waiting</strong>
+      </div>
+
+      <div class="check">
+        <span>Rejection</span>
+        <strong id="rejection">Waiting</strong>
+      </div>
+
+      <div class="check">
+        <span>Momentum</span>
+        <strong id="momentum">Waiting</strong>
+      </div>
+
+      <div class="check">
+        <span>Confirmation</span>
+        <strong id="confirmation">Waiting</strong>
+      </div>
+
+    </div>
+
+  </section>
+
+
+  <section class="explanation">
+
+    <h2>Setup Explanation</h2>
+
+    <p id="explanationText">
+      No confirmed setup. The system is waiting for price action
+      to reach a valid swing/pivot area and provide candle confirmation.
+    </p>
+
+  </section>
+
+
+  <section class="rules">
+
+    <h2>Analysis Engine</h2>
+
+    <div class="rule-list">
+
+      <div>✓ Swing / pivot detection</div>
+      <div>✓ Market structure</div>
+      <div>✓ Liquidity behavior</div>
+      <div>✓ Fresh support / resistance</div>
+      <div>✓ Candlestick confirmation</div>
+      <div>✓ Risk / reward calculation</div>
+      <div>✓ A / B / C setup classification</div>
+      <div>✓ No-trade protection</div>
+
+    </div>
+
+  </section>
+
+
+  <section class="history">
+
+    <div class="section-title">
+      <h2>Signal History</h2>
+      <button id="clearHistory">Clear</button>
+    </div>
+
+    <div id="historyList" class="history-list">
+      <p class="empty">No signals yet.</p>
+    </div>
+
+  </section>
+
+</main>
+
+
+<footer>
+  <p>Successful Pine Script © 2026</p>
+  <p>Educational trading analysis — not financial advice.</p>
+</footer>
+
+<script src="script.js"></script>
+
+</body>
+</html>
