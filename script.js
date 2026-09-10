@@ -1,968 +1,1128 @@
-/*
-  SUCCESSFUL PRECISE AI
-  Deriv Live Market Engine - Version 1
+/* =========================================================
+   SUCCESSFUL PRECISE AI
+   DERIV LIVE MARKET DATA ENGINE
+   ========================================================= */
 
-  Features:
-  - Loads active Deriv symbols automatically
-  - Includes Synthetic Indices
-  - Includes Volatility and 1-second Volatility
-  - Includes Step and Jump indices when active
-  - Excludes Boom/Crash by default
-  - Streams live prices through WebSocket
-*/
+"use strict";
 
-const DERIV_WS_URL =
-  "wss://ws.binaryws.com/websockets/v3";
+/* ---------------------------------------------------------
+   CONNECTION SETTINGS
+--------------------------------------------------------- */
+
+const DERIV_PUBLIC_WS =
+    "wss://api.derivws.com/trading/v1/options/ws/public";
+
+const DERIV_LEGACY_WS =
+    "wss://ws.binaryws.com/websockets/v3";
 
 let ws = null;
 let reconnectTimer = null;
-let activeSymbols = [];
-let currentSymbol = null;
+let reconnectAttempts = 0;
+let usingLegacyEndpoint = false;
+
+let activeMarkets = [];
+let selectedSymbol = null;
 let currentPrice = null;
-let requestId = 1;
 
-/* --------------------------------------------------
-   DOM
--------------------------------------------------- */
+const MAX_RECONNECT_DELAY = 15000;
 
-const marketEl = document.getElementById("market");
-const timeframeEl = document.getElementById("timeframe");
-const analyzeBtn = document.getElementById("analyzeBtn");
+/* ---------------------------------------------------------
+   SAFE DOM HELPERS
+--------------------------------------------------------- */
 
-const selectedMarket = document.getElementById("selectedMarket");
-const selectedTimeframe = document.getElementById("selectedTimeframe");
-const priceEl = document.getElementById("price");
-
-const signalEl = document.getElementById("signal");
-const gradeEl = document.getElementById("grade");
-const directionEl = document.getElementById("direction");
-const setupTypeEl = document.getElementById("setupType");
-const confidenceEl = document.getElementById("confidence");
-const rrEl = document.getElementById("rr");
-
-const entryEl = document.getElementById("entry");
-const slEl = document.getElementById("sl");
-const tp1El = document.getElementById("tp1");
-const tp2El = document.getElementById("tp2");
-
-const swingEl = document.getElementById("swing");
-const structureEl = document.getElementById("structure");
-const liquidityEl = document.getElementById("liquidity");
-const srEl = document.getElementById("sr");
-
-const candleEl = document.getElementById("candle");
-const rejectionEl = document.getElementById("rejection");
-const momentumEl = document.getElementById("momentum");
-const confirmationEl = document.getElementById("confirmation");
-
-const explanationEl =
-  document.getElementById("explanationText");
-
-const historyList =
-  document.getElementById("historyList");
-
-const clearHistory =
-  document.getElementById("clearHistory");
-
-const connectionText =
-  document.getElementById("connectionText");
-
-const statusDot =
-  document.querySelector(".status-dot");
-
-
-/* --------------------------------------------------
-   CONNECTION
--------------------------------------------------- */
-
-function setConnectionStatus(connected, text) {
-
-  if (connectionText) {
-    connectionText.textContent = text;
-  }
-
-  if (statusDot) {
-    statusDot.style.background =
-      connected ? "#35d07f" : "#ff6577";
-  }
+function el(id) {
+    return document.getElementById(id);
 }
 
+function setText(id, text) {
+    const element = el(id);
+    if (element) element.textContent = text;
+}
 
-/* --------------------------------------------------
+/* ---------------------------------------------------------
+   CONNECTION STATUS
+--------------------------------------------------------- */
+
+function setConnectionStatus(message, connected = false) {
+    const possibleIds = [
+        "connectionStatus",
+        "status",
+        "connection-status"
+    ];
+
+    let found = false;
+
+    possibleIds.forEach(id => {
+        const element = el(id);
+
+        if (element) {
+            element.textContent = message;
+            found = true;
+
+            if (connected) {
+                element.classList.add("connected");
+                element.classList.remove("disconnected");
+            } else {
+                element.classList.remove("connected");
+                element.classList.add("disconnected");
+            }
+        }
+    });
+
+    console.log("[Deriv]", message);
+}
+
+/* ---------------------------------------------------------
+   ERROR DISPLAY
+--------------------------------------------------------- */
+
+function showConnectionError(message) {
+    console.error("[Deriv Error]", message);
+
+    setConnectionStatus(
+        "Deriv Error: " + message,
+        false
+    );
+}
+
+/* ---------------------------------------------------------
    CONNECT TO DERIV
--------------------------------------------------- */
+--------------------------------------------------------- */
 
 function connectDeriv() {
 
-  if (ws &&
-      (ws.readyState === WebSocket.OPEN ||
-       ws.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
+    clearTimeout(reconnectTimer);
 
-  setConnectionStatus(false, "Connecting...");
+    setConnectionStatus(
+        usingLegacyEndpoint
+            ? "Connecting to Deriv..."
+            : "Connecting to Deriv..."
+    );
 
-  ws = new WebSocket(DERIV_WS_URL);
+    const endpoint = usingLegacyEndpoint
+        ? DERIV_LEGACY_WS
+        : DERIV_PUBLIC_WS;
 
-  ws.onopen = () => {
-
-    console.log("Deriv WebSocket connected");
-
-    setConnectionStatus(true, "Deriv Live");
-
-    requestActiveSymbols();
-  };
-
-  ws.onmessage = (event) => {
+    console.log("[Deriv] Connecting:", endpoint);
 
     try {
-
-      const data = JSON.parse(event.data);
-
-      handleDerivMessage(data);
-
+        ws = new WebSocket(endpoint);
     } catch (error) {
-
-      console.error(
-        "Invalid Deriv message:",
-        error
-      );
-
+        console.error(error);
+        scheduleReconnect();
+        return;
     }
 
-  };
+    ws.onopen = function () {
 
-  ws.onerror = (error) => {
+        console.log("[Deriv] WebSocket connected");
 
-    console.error(
-      "Deriv WebSocket error:",
-      error
-    );
+        reconnectAttempts = 0;
 
-    setConnectionStatus(
-      false,
-      "Connection Error"
-    );
+        setConnectionStatus(
+            "Deriv Live",
+            true
+        );
 
-  };
+        requestActiveSymbols();
+    };
 
-  ws.onclose = () => {
+    ws.onmessage = function (event) {
 
-    console.log(
-      "Deriv WebSocket disconnected"
-    );
+        try {
 
-    setConnectionStatus(
-      false,
-      "Reconnecting..."
-    );
+            const data = JSON.parse(event.data);
 
-    scheduleReconnect();
+            console.log("[Deriv message]", data);
 
-  };
+            handleDerivMessage(data);
 
+        } catch (error) {
+
+            console.error(
+                "[Deriv] Invalid message:",
+                error
+            );
+        }
+    };
+
+    ws.onerror = function (error) {
+
+        console.error(
+            "[Deriv WebSocket Error]",
+            error
+        );
+
+        setConnectionStatus(
+            "Deriv connection error",
+            false
+        );
+    };
+
+    ws.onclose = function (event) {
+
+        console.warn(
+            "[Deriv] Connection closed:",
+            event.code,
+            event.reason
+        );
+
+        setConnectionStatus(
+            "Reconnecting to Deriv...",
+            false
+        );
+
+        /*
+         * If the new endpoint fails repeatedly,
+         * try the legacy public endpoint as a fallback.
+         */
+
+        if (
+            !usingLegacyEndpoint &&
+            reconnectAttempts >= 2
+        ) {
+            console.log(
+                "[Deriv] Trying legacy endpoint..."
+            );
+
+            usingLegacyEndpoint = true;
+        }
+
+        scheduleReconnect();
+    };
 }
 
-
-/* --------------------------------------------------
+/* ---------------------------------------------------------
    RECONNECT
--------------------------------------------------- */
+--------------------------------------------------------- */
 
 function scheduleReconnect() {
 
-  if (reconnectTimer) {
-    return;
-  }
+    clearTimeout(reconnectTimer);
 
-  reconnectTimer = setTimeout(() => {
+    reconnectAttempts++;
 
-    reconnectTimer = null;
+    const delay = Math.min(
+        2000 * reconnectAttempts,
+        MAX_RECONNECT_DELAY
+    );
 
-    connectDeriv();
+    console.log(
+        `[Deriv] Reconnecting in ${delay / 1000}s`
+    );
 
-  }, 3000);
-
+    reconnectTimer = setTimeout(
+        connectDeriv,
+        delay
+    );
 }
 
-
-/* --------------------------------------------------
-   ACTIVE SYMBOLS
--------------------------------------------------- */
+/* ---------------------------------------------------------
+   REQUEST ACTIVE SYMBOLS
+--------------------------------------------------------- */
 
 function requestActiveSymbols() {
 
-  if (!ws ||
-      ws.readyState !== WebSocket.OPEN) {
-    return;
-  }
-
-  ws.send(JSON.stringify({
-
-    active_symbols: "brief",
-
-    product_type: "basic",
-
-    req_id: requestId++
-
-  }));
-
-}
-
-
-/* --------------------------------------------------
-   HANDLE MESSAGES
--------------------------------------------------- */
-
-function handleDerivMessage(data) {
-
-  if (data.error) {
-
-    console.error(
-      "Deriv API error:",
-      data.error
-    );
-
-    return;
-  }
-
-  if (data.msg_type === "active_symbols") {
-
-    processActiveSymbols(
-      data.active_symbols || []
-    );
-
-    return;
-  }
-
-  if (data.msg_type === "tick") {
-
-    processTick(data.tick);
-
-    return;
-  }
-
-}
-
-
-/* --------------------------------------------------
-   PROCESS SYMBOLS
--------------------------------------------------- */
-
-function processActiveSymbols(symbols) {
-
-  /*
-    Deriv's newer API can use:
-
-    underlying_symbol
-    underlying_symbol_name
-    underlying_symbol_type
-
-    Older responses can use:
-
-    symbol
-    display_name
-    symbol_type
-
-    We support both.
-  */
-
-  activeSymbols = symbols
-    .map(item => {
-
-      return {
-
-        symbol:
-          item.underlying_symbol ||
-          item.symbol,
-
-        name:
-          item.underlying_symbol_name ||
-          item.display_name ||
-          item.symbol,
-
-        type:
-          item.underlying_symbol_type ||
-          item.symbol_type ||
-          "",
-
-        market:
-          item.market || "",
-
-        subgroup:
-          item.subgroup || "",
-
-        submarket:
-          item.submarket || "",
-
-        open:
-          item.exchange_is_open !== 0,
-
-        suspended:
-          item.is_trading_suspended === 1
-
-      };
-
-    })
-    .filter(item => item.symbol);
-
-  populateDerivMarkets();
-
-}
-
-
-/* --------------------------------------------------
-   FILTER SYNTHETIC INDICES
--------------------------------------------------- */
-
-function isSynthetic(symbol) {
-
-  const text = (
-
-    symbol.name +
-    " " +
-    symbol.symbol +
-    " " +
-    symbol.type +
-    " " +
-    symbol.subgroup +
-    " " +
-    symbol.submarket
-
-  ).toLowerCase();
-
-  return (
-
-    text.includes("synthetic") ||
-
-    text.includes("volatility") ||
-
-    text.includes("step index") ||
-
-    text.includes("jump index") ||
-
-    text.includes("range break") ||
-
-    text.includes("high frequency vol") ||
-
-    text.includes("skew step")
-
-  );
-
-}
-
-
-/* --------------------------------------------------
-   EXCLUDE BOOM / CRASH
--------------------------------------------------- */
-
-function isBoomOrCrash(symbol) {
-
-  const text = (
-
-    symbol.name +
-    " " +
-    symbol.symbol +
-    " " +
-    symbol.type
-
-  ).toLowerCase();
-
-  return (
-
-    text.includes("boom") ||
-    text.includes("crash")
-
-  );
-
-}
-
-
-/* --------------------------------------------------
-   POPULATE MARKET SELECTOR
--------------------------------------------------- */
-
-function populateDerivMarkets() {
-
-  if (!marketEl) {
-    return;
-  }
-
-  const previous =
-    marketEl.value;
-
-  marketEl.innerHTML = "";
-
-  /*
-    Add a synthetic-indices heading.
-  */
-
-  const syntheticGroup =
-    document.createElement("optgroup");
-
-  syntheticGroup.label =
-    "DERIV SYNTHETIC INDICES";
-
-  /*
-    Keep synthetic indices.
-
-    Boom/Crash are intentionally
-    excluded from this first version.
-  */
-
-  const syntheticSymbols =
-    activeSymbols
-      .filter(isSynthetic)
-      .filter(item =>
-        !isBoomOrCrash(item)
-      )
-      .sort((a, b) =>
-        a.name.localeCompare(b.name)
-      );
-
-  syntheticSymbols.forEach(item => {
-
-    const option =
-      document.createElement("option");
-
-    option.value =
-      item.symbol;
-
-    option.textContent =
-      item.name;
-
-    syntheticGroup.appendChild(option);
-
-  });
-
-  if (syntheticSymbols.length > 0) {
-
-    marketEl.appendChild(
-      syntheticGroup
-    );
-
-  }
-
-
-  /*
-    Add other active markets.
-  */
-
-  const otherGroup =
-    document.createElement("optgroup");
-
-  otherGroup.label =
-    "OTHER ACTIVE MARKETS";
-
-  const otherSymbols =
-    activeSymbols
-      .filter(item =>
-        !isSynthetic(item)
-      )
-      .filter(item =>
-        !isBoomOrCrash(item)
-      )
-      .sort((a, b) =>
-        a.name.localeCompare(b.name)
-      );
-
-  otherSymbols.forEach(item => {
-
-    const option =
-      document.createElement("option");
-
-    option.value =
-      item.symbol;
-
-    option.textContent =
-      item.name;
-
-    otherGroup.appendChild(option);
-
-  });
-
-  if (otherSymbols.length > 0) {
-
-    marketEl.appendChild(
-      otherGroup
-    );
-
-  }
-
-
-  /*
-    If Deriv returns nothing,
-    show a useful message.
-  */
-
-  if (marketEl.options.length === 0) {
-
-    const option =
-      document.createElement("option");
-
-    option.textContent =
-      "No active Deriv symbols found";
-
-    option.value = "";
-
-    marketEl.appendChild(option);
-
-    setConnectionStatus(
-      true,
-      "No Symbols"
-    );
-
-    return;
-
-  }
-
-
-  /*
-    Restore previous symbol
-    if it still exists.
-  */
-
-  const exists =
-    [...marketEl.options]
-      .some(option =>
-        option.value === previous
-      );
-
-  if (exists) {
-
-    marketEl.value =
-      previous;
-
-  } else {
-
-    /*
-      Prefer Volatility 10
-      if available.
-    */
-
-    const preferred =
-      [...marketEl.options]
-        .find(option =>
-          option.textContent
-            .toLowerCase()
-            .includes("volatility 10")
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        console.warn(
+            "[Deriv] Cannot request symbols. Socket not open."
         );
+        return;
+    }
 
-    if (preferred) {
+    let request;
 
-      marketEl.value =
-        preferred.value;
+    if (usingLegacyEndpoint) {
+
+        request = {
+            active_symbols: "brief",
+            product_type: "basic",
+            req_id: 1
+        };
 
     } else {
 
-      marketEl.selectedIndex = 0;
+        /*
+         * Current Deriv API
+         */
 
+        request = {
+            active_symbols: "brief",
+            req_id: 1
+        };
     }
 
-  }
-
-
-  selectedMarket.textContent =
-    getSelectedMarketName();
-
-  subscribeToSelectedSymbol();
-
-}
-
-
-/* --------------------------------------------------
-   GET SELECTED MARKET NAME
--------------------------------------------------- */
-
-function getSelectedMarketName() {
-
-  const option =
-    marketEl.options[
-      marketEl.selectedIndex
-    ];
-
-  return option
-    ? option.textContent
-    : marketEl.value;
-
-}
-
-
-/* --------------------------------------------------
-   SUBSCRIBE TO TICKS
--------------------------------------------------- */
-
-function subscribeToSelectedSymbol() {
-
-  if (!ws ||
-      ws.readyState !== WebSocket.OPEN) {
-
-    return;
-
-  }
-
-  const symbol =
-    marketEl.value;
-
-  if (!symbol) {
-    return;
-  }
-
-  /*
-    Ask Deriv to stop previous
-    tick subscriptions.
-  */
-
-  try {
-
-    ws.send(JSON.stringify({
-
-      forget_all:
-        "ticks"
-
-    }));
-
-  } catch (error) {
-
-    console.warn(
-      "Could not clear old subscription",
-      error
+    console.log(
+        "[Deriv] Requesting active symbols:",
+        request
     );
 
-  }
-
-
-  currentSymbol =
-    symbol;
-
-  currentPrice =
-    null;
-
-  setConnectionStatus(
-    true,
-    "Subscribing..."
-  );
-
-
-  ws.send(JSON.stringify({
-
-    ticks: symbol,
-
-    subscribe: 1,
-
-    req_id: requestId++
-
-  }));
-
-
-  selectedMarket.textContent =
-    getSelectedMarketName();
-
+    ws.send(
+        JSON.stringify(request)
+    );
 }
 
+/* ---------------------------------------------------------
+   HANDLE DERIV MESSAGES
+--------------------------------------------------------- */
 
-/* --------------------------------------------------
+function handleDerivMessage(data) {
+
+    /*
+     * API ERROR
+     */
+
+    if (data.error) {
+
+        console.error(
+            "[Deriv API Error]",
+            data.error
+        );
+
+        showConnectionError(
+            data.error.message ||
+            data.error.code ||
+            "API request failed"
+        );
+
+        return;
+    }
+
+    /*
+     * ACTIVE SYMBOLS
+     */
+
+    if (
+        data.msg_type === "active_symbols" ||
+        Array.isArray(data.active_symbols)
+    ) {
+
+        processActiveSymbols(
+            data.active_symbols || []
+        );
+
+        return;
+    }
+
+    /*
+     * LIVE TICK
+     */
+
+    if (
+        data.msg_type === "tick" &&
+        data.tick
+    ) {
+
+        processTick(
+            data.tick
+        );
+
+        return;
+    }
+}
+
+/* ---------------------------------------------------------
+   PROCESS ACTIVE SYMBOLS
+--------------------------------------------------------- */
+
+function processActiveSymbols(symbols) {
+
+    console.log(
+        `[Deriv] Received ${symbols.length} active symbols`
+    );
+
+    activeMarkets = symbols
+        .map(normalizeSymbol)
+        .filter(Boolean);
+
+    /*
+     * Remove duplicates
+     */
+
+    const unique = new Map();
+
+    activeMarkets.forEach(market => {
+
+        if (
+            market.symbol &&
+            !unique.has(market.symbol)
+        ) {
+            unique.set(
+                market.symbol,
+                market
+            );
+        }
+    });
+
+    activeMarkets = Array.from(
+        unique.values()
+    );
+
+    /*
+     * Sort alphabetically
+     */
+
+    activeMarkets.sort(
+        (a, b) =>
+            a.name.localeCompare(b.name)
+    );
+
+    console.log(
+        "[Deriv] Usable markets:",
+        activeMarkets
+    );
+
+    populateMarketSelector();
+
+    /*
+     * Automatically select a useful market
+     */
+
+    autoSelectPreferredMarket();
+}
+
+/* ---------------------------------------------------------
+   NORMALIZE SYMBOL
+--------------------------------------------------------- */
+
+function normalizeSymbol(item) {
+
+    if (!item) return null;
+
+    const symbol =
+        item.underlying_symbol ||
+        item.symbol ||
+        "";
+
+    const name =
+        item.underlying_symbol_name ||
+        item.display_name ||
+        symbol;
+
+    const type =
+        item.underlying_symbol_type ||
+        item.symbol_type ||
+        item.market ||
+        "";
+
+    if (!symbol) return null;
+
+    return {
+        symbol: symbol,
+        name: name,
+        type: String(type).toLowerCase(),
+        market: String(
+            item.market || ""
+        ).toLowerCase(),
+
+        subgroup:
+            String(
+                item.subgroup || ""
+            ).toLowerCase(),
+
+        submarket:
+            String(
+                item.submarket || ""
+            ).toLowerCase(),
+
+        pipSize:
+            item.pip_size ||
+            item.pip ||
+            null
+    };
+}
+
+/* ---------------------------------------------------------
+   MARKET CLASSIFICATION
+--------------------------------------------------------- */
+
+function classifyMarket(market) {
+
+    const text = (
+        market.name + " " +
+        market.symbol + " " +
+        market.type + " " +
+        market.market + " " +
+        market.subgroup + " " +
+        market.submarket
+    ).toLowerCase();
+
+    /*
+     * BOOM / CRASH
+     */
+
+    if (
+        text.includes("boom") ||
+        text.includes("crash")
+    ) {
+        return "Boom & Crash";
+    }
+
+    /*
+     * VOLATILITY
+     */
+
+    if (
+        text.includes("volatility") ||
+        text.includes("vol ")
+    ) {
+
+        if (
+            text.includes("(1s)") ||
+            text.includes("1s") ||
+            text.includes("1-second") ||
+            text.includes("1 second")
+        ) {
+            return "Volatility Indices — 1s";
+        }
+
+        return "Volatility Indices";
+    }
+
+    /*
+     * STEP
+     */
+
+    if (
+        text.includes("step")
+    ) {
+        return "Step Indices";
+    }
+
+    /*
+     * JUMP
+     */
+
+    if (
+        text.includes("jump")
+    ) {
+        return "Jump Indices";
+    }
+
+    /*
+     * RANGE BREAK
+     */
+
+    if (
+        text.includes("range break")
+    ) {
+        return "Range Break";
+    }
+
+    /*
+     * HIGH FREQUENCY VOL
+     */
+
+    if (
+        text.includes("high frequency") ||
+        text.includes("hf vol")
+    ) {
+        return "High Frequency Volatility";
+    }
+
+    /*
+     * SYNTHETIC
+     */
+
+    if (
+        text.includes("synthetic") ||
+        market.type.includes("synthetic")
+    ) {
+        return "Other Synthetic Indices";
+    }
+
+    /*
+     * FOREX
+     */
+
+    if (
+        market.type.includes("forex") ||
+        market.market.includes("forex") ||
+        text.includes("major_pairs") ||
+        text.includes("minor_pairs") ||
+        text.includes("exotic_pairs")
+    ) {
+        return "Forex Currency Pairs";
+    }
+
+    /*
+     * CRYPTO
+     */
+
+    if (
+        market.type.includes("crypto") ||
+        market.market.includes("crypto") ||
+        text.includes("bitcoin") ||
+        text.includes("ethereum") ||
+        text.includes("crypto")
+    ) {
+        return "Crypto";
+    }
+
+    /*
+     * METALS
+     */
+
+    if (
+        text.includes("gold") ||
+        text.includes("silver") ||
+        text.includes("platinum") ||
+        text.includes("palladium") ||
+        text.includes("metal") ||
+        market.submarket.includes("metals")
+    ) {
+        return "Metals";
+    }
+
+    /*
+     * INDICES
+     */
+
+    if (
+        market.type.includes("indices") ||
+        market.market.includes("indices") ||
+        text.includes("index") ||
+        text.includes("indices")
+    ) {
+        return "Indices";
+    }
+
+    /*
+     * STOCKS
+     */
+
+    if (
+        market.type.includes("stock") ||
+        market.market.includes("stocks") ||
+        text.includes("stock")
+    ) {
+        return "Stocks";
+    }
+
+    return "Other Active Markets";
+}
+
+/* ---------------------------------------------------------
+   POPULATE MARKET SELECTOR
+--------------------------------------------------------- */
+
+function populateMarketSelector() {
+
+    const marketSelect = el("market");
+
+    if (!marketSelect) {
+
+        console.error(
+            "Market selector #market was not found."
+        );
+
+        return;
+    }
+
+    marketSelect.innerHTML = "";
+
+    /*
+     * Group order
+     */
+
+    const groupOrder = [
+        "Forex Currency Pairs",
+        "Indices",
+        "Metals",
+        "Crypto",
+        "Volatility Indices",
+        "Volatility Indices — 1s",
+        "Step Indices",
+        "Jump Indices",
+        "Boom & Crash",
+        "Range Break",
+        "High Frequency Volatility",
+        "Other Synthetic Indices",
+        "Stocks",
+        "Other Active Markets"
+    ];
+
+    const groups = {};
+
+    groupOrder.forEach(
+        group => {
+            groups[group] = [];
+        }
+    );
+
+    activeMarkets.forEach(market => {
+
+        const category =
+            classifyMarket(market);
+
+        if (!groups[category]) {
+            groups[category] = [];
+        }
+
+        groups[category].push(
+            market
+        );
+    });
+
+    /*
+     * Create option groups
+     */
+
+    Object.keys(groups).forEach(
+        category => {
+
+            const markets =
+                groups[category];
+
+            if (!markets.length) {
+                return;
+            }
+
+            const optgroup =
+                document.createElement(
+                    "optgroup"
+                );
+
+            optgroup.label =
+                `${category} (${markets.length})`;
+
+            markets.forEach(
+                market => {
+
+                    const option =
+                        document.createElement(
+                            "option"
+                        );
+
+                    option.value =
+                        market.symbol;
+
+                    option.textContent =
+                        `${market.name} — ${market.symbol}`;
+
+                    option.dataset.type =
+                        market.type;
+
+                    option.dataset.category =
+                        category;
+
+                    optgroup.appendChild(
+                        option
+                    );
+                }
+            );
+
+            marketSelect.appendChild(
+                optgroup
+            );
+        }
+    );
+
+    /*
+     * Market selection listener
+     */
+
+    marketSelect.onchange =
+        function () {
+
+            const symbol =
+                this.value;
+
+            if (!symbol) return;
+
+            subscribeToMarket(
+                symbol
+            );
+        };
+
+    console.log(
+        "[Deriv] Market selector populated."
+    );
+}
+
+/* ---------------------------------------------------------
+   AUTO SELECT PREFERRED MARKET
+--------------------------------------------------------- */
+
+function autoSelectPreferredMarket() {
+
+    const marketSelect =
+        el("market");
+
+    if (!marketSelect) return;
+
+    if (!activeMarkets.length) {
+        return;
+    }
+
+    /*
+     * Try Volatility 10 first
+     */
+
+    let preferred =
+        activeMarkets.find(
+            m =>
+                /volatility\s*10(?!\d)/i.test(
+                    m.name
+                ) &&
+                !/1s|1-second/i.test(
+                    m.name
+                )
+        );
+
+    /*
+     * Then Volatility 10 1s
+     */
+
+    if (!preferred) {
+
+        preferred =
+            activeMarkets.find(
+                m =>
+                    /volatility\s*10/i.test(
+                        m.name
+                    )
+            );
+    }
+
+    /*
+     * Then any volatility
+     */
+
+    if (!preferred) {
+
+        preferred =
+            activeMarkets.find(
+                m =>
+                    classifyMarket(m)
+                        .includes(
+                            "Volatility"
+                        )
+            );
+    }
+
+    /*
+     * Finally first available market
+     */
+
+    if (!preferred) {
+        preferred =
+            activeMarkets[0];
+    }
+
+    marketSelect.value =
+        preferred.symbol;
+
+    subscribeToMarket(
+        preferred.symbol
+    );
+}
+
+/* ---------------------------------------------------------
+   SUBSCRIBE TO LIVE TICKS
+--------------------------------------------------------- */
+
+function subscribeToMarket(symbol) {
+
+    if (
+        !ws ||
+        ws.readyState !== WebSocket.OPEN
+    ) {
+
+        console.warn(
+            "[Deriv] Socket not ready."
+        );
+
+        return;
+    }
+
+    selectedSymbol =
+        symbol;
+
+    /*
+     * Clear previous tick subscriptions
+     */
+
+    try {
+
+        ws.send(
+            JSON.stringify({
+                forget_all: "ticks",
+                req_id: 10
+            })
+        );
+
+    } catch (error) {
+
+        console.warn(
+            "[Deriv] Could not clear old tick subscription",
+            error
+        );
+    }
+
+    /*
+     * Subscribe to selected market
+     */
+
+    const request = {
+        ticks: symbol,
+        subscribe: 1,
+        req_id: 11
+    };
+
+    console.log(
+        "[Deriv] Subscribing to:",
+        symbol
+    );
+
+    ws.send(
+        JSON.stringify(request)
+    );
+
+    /*
+     * Reset displayed price
+     */
+
+    setText(
+        "price",
+        "Waiting for price..."
+    );
+
+    setText(
+        "currentPrice",
+        "Waiting for price..."
+    );
+
+    /*
+     * Show selected market
+     */
+
+    const market =
+        activeMarkets.find(
+            m =>
+                m.symbol === symbol
+        );
+
+    if (market) {
+
+        setText(
+            "selectedMarket",
+            market.name
+        );
+
+        setText(
+            "marketName",
+            market.name
+        );
+    }
+}
+
+/* ---------------------------------------------------------
    PROCESS LIVE TICK
--------------------------------------------------- */
+--------------------------------------------------------- */
 
 function processTick(tick) {
 
-  if (!tick) {
-    return;
-  }
-
-  currentPrice =
-    Number(tick.quote);
-
-  if (!Number.isFinite(currentPrice)) {
-    return;
-  }
-
-  priceEl.textContent =
-    formatLivePrice(
-      currentPrice
-    );
-
-  setConnectionStatus(
-    true,
-    "Deriv Live"
-  );
-
-}
-
-
-/* --------------------------------------------------
-   FORMAT PRICE
--------------------------------------------------- */
-
-function formatLivePrice(price) {
-
-  const symbol =
-    currentSymbol || "";
-
-  const market =
-    getSelectedMarketName()
-      .toLowerCase();
-
-  if (
-    market.includes("volatility") ||
-    market.includes("step") ||
-    market.includes("jump") ||
-    market.includes("range")
-  ) {
-
-    return price.toFixed(2);
-
-  }
-
-  if (
-    symbol.includes("JPY")
-  ) {
-
-    return price.toFixed(3);
-
-  }
-
-  if (
-    symbol.includes("BTC")
-  ) {
-
-    return price.toFixed(2);
-
-  }
-
-  return price.toFixed(5);
-
-}
-
-
-/* --------------------------------------------------
-   DEMO ANALYSIS
---------------------------------------------------
-
-   IMPORTANT:
-
-   The price is now LIVE from Deriv.
-
-   The actual A/B/C trading logic is
-   still the next engine stage.
-
-   We do NOT pretend that random data
-   is real AI analysis.
--------------------------------------------------- */
-
-function analyzeMarket() {
-
-  if (!currentPrice) {
-
-    explanationEl.textContent =
-      "Waiting for live Deriv price data. " +
-      "Select a market and wait for the live " +
-      "price before requesting analysis.";
-
-    return;
-
-  }
-
-  const market =
-    getSelectedMarketName();
-
-  const timeframe =
-    timeframeEl.value;
-
-  analyzeBtn.textContent =
-    "ANALYZING...";
-
-
-  setTimeout(() => {
+    if (
+        !tick ||
+        tick.quote === undefined
+    ) {
+        return;
+    }
 
     /*
-      Temporary placeholder.
+     * Ignore ticks from a different market
+     */
 
-      We intentionally return NO SETUP
-      until the real candle/structure engine
-      is connected.
-    */
+    if (
+        selectedSymbol &&
+        tick.symbol &&
+        tick.symbol !== selectedSymbol
+    ) {
+        return;
+    }
 
-    signalEl.textContent =
-      "NO SETUP";
+    currentPrice =
+        Number(tick.quote);
 
-    gradeEl.textContent =
-      "WAIT";
+    const formatted =
+        formatPrice(
+            currentPrice
+        );
 
-    gradeEl.className =
-      "grade neutral";
+    /*
+     * Update common price elements
+     */
 
-    directionEl.textContent =
-      "Waiting";
-
-    setupTypeEl.textContent =
-      "Live data ready";
-
-    confidenceEl.textContent =
-      "—";
-
-    rrEl.textContent =
-      "—";
-
-    entryEl.textContent =
-      "—";
-
-    slEl.textContent =
-      "—";
-
-    tp1El.textContent =
-      "—";
-
-    tp2El.textContent =
-      "—";
-
-    swingEl.textContent =
-      "Waiting";
-
-    structureEl.textContent =
-      "Waiting";
-
-    liquidityEl.textContent =
-      "Waiting";
-
-    srEl.textContent =
-      "Waiting";
-
-    candleEl.textContent =
-      "Waiting";
-
-    rejectionEl.textContent =
-      "Waiting";
-
-    momentumEl.textContent =
-      "Waiting";
-
-    confirmationEl.textContent =
-      "Waiting";
-
-
-    explanationEl.textContent =
-
-      `Live ${market} price data is connected ` +
-      `on the ${timeframe} timeframe. ` +
-      `The system will not generate a BUY or SELL ` +
-      `signal until the required swing/pivot, ` +
-      `market structure, support/resistance and ` +
-      `candlestick confirmation conditions are met. ` +
-      `Current live price: ${formatLivePrice(currentPrice)}. ` +
-      `NO SETUP means no confirmed trade exists yet.`;
-
-
-    analyzeBtn.textContent =
-      "ANALYZE MARKET";
-
-  }, 500);
-
-}
-
-
-/* --------------------------------------------------
-   HISTORY
--------------------------------------------------- */
-
-function addHistory(
-  market,
-  timeframe,
-  direction,
-  grade,
-  entry
-) {
-
-  if (!historyList) {
-    return;
-  }
-
-  const empty =
-    historyList.querySelector(
-      ".empty"
+    setText(
+        "price",
+        formatted
     );
 
-  if (empty) {
-    empty.remove();
-  }
+    setText(
+        "currentPrice",
+        formatted
+    );
 
-  const item =
-    document.createElement("div");
+    setText(
+        "livePrice",
+        formatted
+    );
 
-  item.className =
-    "history-item";
+    /*
+     * Update timestamp
+     */
 
-  item.textContent =
+    const time =
+        tick.epoch
+            ? new Date(
+                tick.epoch * 1000
+            ).toLocaleTimeString()
+            : new Date()
+                .toLocaleTimeString();
 
-    `${new Date().toLocaleTimeString()} — ` +
-    `${market} ${timeframe} — ` +
-    `${direction} — ${grade} — ` +
-    `Entry ${entry}`;
+    setText(
+        "priceTime",
+        "Live: " + time
+    );
 
-  historyList.prepend(item);
+    setText(
+        "lastUpdate",
+        "Updated: " + time
+    );
 
+    /*
+     * Store latest tick for analysis engine
+     */
+
+    window.successfulPreciseAI = {
+        symbol: selectedSymbol,
+        price: currentPrice,
+        epoch: tick.epoch || null
+    };
 }
 
+/* ---------------------------------------------------------
+   PRICE FORMAT
+--------------------------------------------------------- */
 
-/* --------------------------------------------------
-   EVENTS
--------------------------------------------------- */
+function formatPrice(price) {
 
-marketEl.addEventListener(
-  "change",
-  () => {
-
-    selectedMarket.textContent =
-      getSelectedMarketName();
-
-    subscribeToSelectedSymbol();
-
-  }
-);
-
-
-timeframeEl.addEventListener(
-  "change",
-  () => {
-
-    selectedTimeframe.textContent =
-      timeframeEl.value;
-
-  }
-);
-
-
-analyzeBtn.addEventListener(
-  "click",
-  analyzeMarket
-);
-
-
-if (clearHistory) {
-
-  clearHistory.addEventListener(
-    "click",
-    () => {
-
-      historyList.innerHTML =
-        '<p class="empty">No signals yet.</p>';
-
+    if (!Number.isFinite(price)) {
+        return "--";
     }
-  );
 
+    if (price >= 1000) {
+        return price.toFixed(2);
+    }
+
+    if (price >= 100) {
+        return price.toFixed(3);
+    }
+
+    if (price >= 10) {
+        return price.toFixed(3);
+    }
+
+    if (price >= 1) {
+        return price.toFixed(5);
+    }
+
+    return price.toFixed(8);
 }
 
+/* ---------------------------------------------------------
+   BASIC LIVE STATUS
+--------------------------------------------------------- */
 
-/* --------------------------------------------------
+function updateLiveStatus() {
+
+    if (
+        ws &&
+        ws.readyState === WebSocket.OPEN
+    ) {
+
+        setConnectionStatus(
+            "Deriv Live",
+            true
+        );
+
+    } else {
+
+        setConnectionStatus(
+            "Deriv Offline",
+            false
+        );
+    }
+}
+
+/* ---------------------------------------------------------
+   PAGE INITIALIZATION
+--------------------------------------------------------- */
+
+function initializeSuccessfulPreciseAI() {
+
+    console.log(
+        "===================================="
+    );
+
+    console.log(
+        "SUCCESSFUL PRECISE AI"
+    );
+
+    console.log(
+        "Deriv Live Market Engine Starting..."
+    );
+
+    console.log(
+        "===================================="
+    );
+
+    /*
+     * Make sure the market selector exists.
+     */
+
+    const marketSelect =
+        el("market");
+
+    if (marketSelect) {
+
+        marketSelect.innerHTML =
+            `<option value="">
+                Loading Deriv markets...
+            </option>`;
+    }
+
+    /*
+     * Connect to Deriv
+     */
+
+    connectDeriv();
+
+    /*
+     * Keep status fresh
+     */
+
+    setInterval(
+        updateLiveStatus,
+        5000
+    );
+}
+
+/* ---------------------------------------------------------
    START
--------------------------------------------------- */
+--------------------------------------------------------- */
 
-selectedTimeframe.textContent =
-  timeframeEl.value;
+if (
+    document.readyState === "loading"
+) {
 
-setConnectionStatus(
-  false,
-  "Connecting..."
-);
+    document.addEventListener(
+        "DOMContentLoaded",
+        initializeSuccessfulPreciseAI
+    );
 
-connectDeriv();
+} else {
+
+    initializeSuccessfulPreciseAI();
+}
