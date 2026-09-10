@@ -1,1468 +1,1729 @@
-const DERIV_URL =
+/* =========================================================
+   SUCCESSFUL PINE SCRIPT
+   PROGRESSIVE LIVE SIGNAL ENGINE
+   Deriv Public Market Data
+   ========================================================= */
+
+const DERIV_WS =
   "wss://api.derivws.com/trading/v1/options/ws/public";
 
-let socket = null;
-let reconnectTimer = null;
-let reconnectDelay = 2000;
+let ws = null;
+let selectedSymbol = "";
+let selectedTimeframe = "M5";
+let selectedPrice = 0;
 
-let activeMarkets = [];
-let selectedSymbol = null;
+let candles = [];
+let candleCache = {};
 
-let candles = {
-  M1: [],
-  M5: [],
-  M15: [],
-  M30: [],
-  H1: [],
-  H2: [],
-  H4: [],
-  Daily: []
+let currentSignal = null;
+let lastAlertKey = "";
+
+const TIMEFRAMES = {
+  M1: 1,
+  M5: 5,
+  M15: 15,
+  M30: 30,
+  H1: 60,
+  H2: 120,
+  H4: 240,
+  Daily: 1440
 };
 
-let currentTicks = [];
-let lastAnalysisTime = 0;
+/* =========================================================
+   DOM HELPERS
+   ========================================================= */
 
-const connectionText =
-  document.getElementById("connectionText");
+function $(id) {
+  return document.getElementById(id);
+}
 
-const marketSelect =
-  document.getElementById("market");
+function setText(id, value) {
+  const el = $(id);
+  if (el) el.textContent = value;
+}
 
-const priceElement =
-  document.getElementById("price");
+function safeNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
 
-const selectedMarketElement =
-  document.getElementById("selectedMarket");
+function roundPrice(price) {
+  if (!Number.isFinite(price)) return "-";
 
-const timeframeSelect =
-  document.getElementById("timeframe");
+  if (price >= 1000) return price.toFixed(2);
+  if (price >= 100) return price.toFixed(3);
+  if (price >= 10) return price.toFixed(4);
+  if (price >= 1) return price.toFixed(5);
 
-const selectedTimeframeElement =
-  document.getElementById("selectedTimeframe");
+  return price.toFixed(5);
+}
 
-const analyzeButton =
-  document.getElementById("analyzeBtn");
+/* =========================================================
+   CONNECTION
+   ========================================================= */
 
-function setStatus(text) {
-  if (connectionText) {
-    connectionText.textContent = text;
+function updateConnection(text, live = false) {
+  setText("connectionText", text);
+
+  const dot = document.querySelector(".status-dot");
+
+  if (dot) {
+    dot.style.opacity = live ? "1" : "0.5";
   }
-
-  console.log("[DERIV]", text);
 }
 
 function connectDeriv() {
-  clearTimeout(reconnectTimer);
-
-  setStatus("Connecting to Deriv...");
+  updateConnection("Connecting to Deriv...", false);
 
   try {
-    socket = new WebSocket(DERIV_URL);
+    ws = new WebSocket(DERIV_WS);
+
+    ws.onopen = () => {
+      updateConnection("LIVE", true);
+      loadMarkets();
+    };
+
+    ws.onmessage = handleMessage;
+
+    ws.onerror = () => {
+      updateConnection("Connection error", false);
+    };
+
+    ws.onclose = () => {
+      updateConnection("Reconnecting...", false);
+
+      setTimeout(() => {
+        connectDeriv();
+      }, 3000);
+    };
   } catch (error) {
     console.error(error);
-    reconnect();
+    updateConnection("Connection failed", false);
+  }
+}
+
+/* =========================================================
+   DERIV MESSAGE HANDLER
+   ========================================================= */
+
+function handleMessage(event) {
+  let data;
+
+  try {
+    data = JSON.parse(event.data);
+  } catch {
     return;
   }
 
-  socket.onopen = function () {
-    console.log("DERIV LIVE CONNECTION SUCCESSFUL");
-
-    setStatus("LIVE • DERIV CONNECTED");
-
-    reconnectDelay = 2000;
-
-    requestActiveMarkets();
-  };
-
-  socket.onmessage = function (event) {
-    let data;
-
-    try {
-      data = JSON.parse(event.data);
-    } catch (error) {
-      console.error("Invalid response:", event.data);
-      return;
-    }
-
-    console.log("DERIV:", data);
-
-    if (data.error) {
-      console.error("DERIV ERROR:", data.error);
-      return;
-    }
-
-    if (data.msg_type === "active_symbols") {
-      loadMarkets(data.active_symbols || []);
-      return;
-    }
-
-    if (data.msg_type === "tick") {
-      handleTick(data);
-      return;
-    }
-
-    if (data.msg_type === "history") {
-      handleHistory(data);
-      return;
-    }
-
-    if (data.msg_type === "candles") {
-      handleHistory(data);
-      return;
-    }
-  };
-
-  socket.onerror = function (error) {
-    console.error("DERIV WEBSOCKET ERROR:", error);
-    setStatus("DERIV CONNECTION ERROR");
-  };
-
-  socket.onclose = function () {
-    console.warn("DERIV CONNECTION CLOSED");
-
-    setStatus("Disconnected • Reconnecting...");
-
-    reconnect();
-  };
-}
-
-
-/* =========================
-   ACTIVE MARKETS
-========================= */
-
-function requestActiveMarkets() {
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
+  if (data.error) {
+    console.error("Deriv error:", data.error);
     return;
   }
 
-  socket.send(JSON.stringify({
-    active_symbols: "brief",
-    req_id: 1
-  }));
+  if (data.msg_type === "active_symbols") {
+    populateMarkets(data.active_symbols || []);
+    return;
+  }
+
+  if (data.msg_type === "tick") {
+    handleTick(data);
+    return;
+  }
+
+  if (data.msg_type === "candles") {
+    handleHistoricalCandles(data);
+    return;
+  }
 }
 
-function loadMarkets(symbols) {
-  activeMarkets = symbols
-    .map(function (item) {
-      return {
-        symbol:
-          item.underlying_symbol ||
-          item.symbol,
+/* =========================================================
+   MARKET LOADING
+   ========================================================= */
 
-        name:
-          item.underlying_symbol_name ||
-          item.display_name ||
-          item.underlying_symbol ||
-          item.symbol,
+function loadMarkets() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-        type:
-          item.underlying_symbol_type ||
-          item.symbol_type ||
-          "",
-
-        market:
-          item.market || "",
-
-        subgroup:
-          item.subgroup || "",
-
-        submarket:
-          item.submarket || "",
-
-        suspended:
-          item.is_trading_suspended === 1
-      };
+  ws.send(
+    JSON.stringify({
+      active_symbols: "full"
     })
-    .filter(function (item) {
-      return item.symbol && !item.suspended;
-    });
-
-  console.log(
-    "Loaded Deriv markets:",
-    activeMarkets.length
   );
-
-  populateMarkets();
-
-  const preferred = findPreferredMarket();
-
-  if (preferred) {
-    selectMarket(preferred.symbol);
-  } else if (activeMarkets.length) {
-    selectMarket(activeMarkets[0].symbol);
-  }
 }
 
-function populateMarkets() {
-  if (!marketSelect) return;
+function populateMarkets(symbols) {
+  const market = $("market");
 
-  marketSelect.innerHTML = "";
+  if (!market) return;
+
+  market.innerHTML = "";
 
   const groups = {
-    forex: document.createElement("optgroup"),
-    indices: document.createElement("optgroup"),
-    metals: document.createElement("optgroup"),
-    crypto: document.createElement("optgroup"),
-    synthetic: document.createElement("optgroup"),
-    other: document.createElement("optgroup")
+    "Deriv Synthetic Indices": [],
+    Forex: [],
+    "Global Indices": [],
+    Metals: [],
+    Commodities: [],
+    Crypto: [],
+    Other: []
   };
 
-  groups.forex.label = "FOREX";
-  groups.indices.label = "GLOBAL INDICES";
-  groups.metals.label = "METALS / COMMODITIES";
-  groups.crypto.label = "CRYPTO";
-  groups.synthetic.label = "DERIV SYNTHETIC INDICES";
-  groups.other.label = "OTHER MARKETS";
+  symbols.forEach(item => {
+    const symbol =
+      item.underlying_symbol ||
+      item.symbol ||
+      "";
 
-  activeMarkets.forEach(function (market) {
-    const option =
-      document.createElement("option");
+    const name =
+      item.underlying_symbol_name ||
+      item.display_name ||
+      symbol;
 
-    option.value = market.symbol;
+    const type =
+      String(
+        item.underlying_symbol_type ||
+        item.symbol_type ||
+        ""
+      ).toLowerCase();
 
-    option.textContent =
-      market.name +
-      " [" +
-      market.symbol +
-      "]";
+    if (!symbol) return;
 
-    groups[getCategory(market)]
-      .appendChild(option);
-  });
+    let group = "Other";
 
-  Object.keys(groups).forEach(function (key) {
-    if (groups[key].children.length) {
-      marketSelect.appendChild(groups[key]);
+    if (
+      type.includes("synthetic") ||
+      /volatility|step|jump|boom|crash|range break/i.test(name)
+    ) {
+      group = "Deriv Synthetic Indices";
+    } else if (
+      type.includes("forex") ||
+      /^[A-Z]{6}$/.test(symbol)
+    ) {
+      group = "Forex";
+    } else if (
+      type.includes("indices") ||
+      type.includes("index") ||
+      /nasdaq|dow|dax|s&p|spx|ftse|nikkei/i.test(name)
+    ) {
+      group = "Global Indices";
+    } else if (
+      type.includes("metal") ||
+      /gold|silver|platinum|palladium/i.test(name)
+    ) {
+      group = "Metals";
+    } else if (
+      type.includes("commodity") ||
+      /oil|gas|brent|crude/i.test(name)
+    ) {
+      group = "Commodities";
+    } else if (
+      type.includes("crypto") ||
+      /bitcoin|ethereum|litecoin|crypto/i.test(name)
+    ) {
+      group = "Crypto";
     }
-  });
-}
 
-function getCategory(market) {
-  const text = (
-    market.name +
-    " " +
-    market.type +
-    " " +
-    market.market +
-    " " +
-    market.subgroup +
-    " " +
-    market.submarket
-  ).toLowerCase();
-
-  if (
-    text.includes("volatility") ||
-    text.includes("step index") ||
-    text.includes("jump index") ||
-    text.includes("boom") ||
-    text.includes("crash") ||
-    text.includes("range break") ||
-    text.includes("high frequency")
-  ) {
-    return "synthetic";
-  }
-
-  if (
-    text.includes("forex")
-  ) {
-    return "forex";
-  }
-
-  if (
-    text.includes("gold") ||
-    text.includes("silver") ||
-    text.includes("platinum") ||
-    text.includes("palladium") ||
-    text.includes("metal") ||
-    text.includes("commodity")
-  ) {
-    return "metals";
-  }
-
-  if (
-    text.includes("crypto") ||
-    text.includes("bitcoin") ||
-    text.includes("ethereum") ||
-    text.includes("litecoin") ||
-    text.includes("dogecoin") ||
-    text.includes("ripple") ||
-    text.includes("solana")
-  ) {
-    return "crypto";
-  }
-
-  if (
-    text.includes("index") ||
-    text.includes("nasdaq") ||
-    text.includes("dow") ||
-    text.includes("s&p") ||
-    text.includes("wall street")
-  ) {
-    return "indices";
-  }
-
-  return "other";
-}
-
-function findPreferredMarket() {
-  const preferredNames = [
-    "volatility 10",
-    "volatility 15",
-    "volatility 25",
-    "volatility 50",
-    "step index",
-    "eur/usd"
-  ];
-
-  for (let name of preferredNames) {
-    const found = activeMarkets.find(function (market) {
-      return market.name
-        .toLowerCase()
-        .includes(name);
+    groups[group].push({
+      symbol,
+      name
     });
+  });
 
-    if (found) return found;
+  Object.entries(groups).forEach(([groupName, items]) => {
+    if (!items.length) return;
+
+    const optgroup = document.createElement("optgroup");
+    optgroup.label = groupName;
+
+    items
+      .sort((a, b) =>
+        a.name.localeCompare(b.name)
+      )
+      .forEach(item => {
+        const option =
+          document.createElement("option");
+
+        option.value = item.symbol;
+        option.textContent =
+          `${item.name} (${item.symbol})`;
+
+        optgroup.appendChild(option);
+      });
+
+    market.appendChild(optgroup);
+  });
+
+  if (market.options.length > 0) {
+    const firstOption =
+      market.querySelector("option:not([disabled])");
+
+    if (firstOption) {
+      selectedSymbol = firstOption.value;
+      market.value = selectedSymbol;
+
+      subscribeToMarket(selectedSymbol);
+    }
   }
-
-  return null;
 }
 
-
-/* =========================
+/* =========================================================
    MARKET SELECTION
-========================= */
+   ========================================================= */
 
-if (marketSelect) {
-  marketSelect.addEventListener(
-    "change",
-    function () {
-      selectMarket(this.value);
-    }
+const marketElement = $("market");
+
+if (marketElement) {
+  marketElement.addEventListener("change", () => {
+    selectedSymbol = marketElement.value;
+
+    candleCache = {};
+    candles = [];
+    currentSignal = null;
+    lastAlertKey = "";
+
+    setText("signal", "ANALYZING");
+    setText("direction", "Waiting...");
+    setText("setup", "Waiting for market structure...");
+    setText("confidence", "-");
+    setText("rr", "-");
+
+    subscribeToMarket(selectedSymbol);
+  });
+}
+
+function subscribeToMarket(symbol) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!symbol) return;
+
+  try {
+    ws.send(
+      JSON.stringify({
+        forget_all: "ticks"
+      })
+    );
+  } catch {}
+
+  ws.send(
+    JSON.stringify({
+      ticks: symbol,
+      subscribe: 1
+    })
+  );
+
+  requestHistoricalData(symbol);
+}
+
+/* =========================================================
+   HISTORICAL DATA
+   ========================================================= */
+
+function requestHistoricalData(symbol) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  ws.send(
+    JSON.stringify({
+      ticks_history: symbol,
+      style: "candles",
+      granularity: 60,
+      count: 1000,
+      end: "latest"
+    })
   );
 }
 
-function selectMarket(symbol) {
-  if (!symbol) return;
+function handleHistoricalCandles(data) {
+  if (!data.candles) return;
 
-  selectedSymbol = symbol;
+  candles = data.candles.map(c => ({
+    time: Number(c.epoch),
+    open: Number(c.open),
+    high: Number(c.high),
+    low: Number(c.low),
+    close: Number(c.close)
+  }));
 
-  const market =
-    activeMarkets.find(function (item) {
-      return item.symbol === symbol;
-    });
-
-  if (market) {
-    showSelectedMarket(market);
-  }
-
-  subscribeToTicks(symbol);
-
-  requestHistoricalCandles(symbol);
+  analyzeProgressively();
 }
 
-function showSelectedMarket(market) {
-  if (selectedMarketElement) {
-    selectedMarketElement.textContent =
-      market.name;
-  }
-}
-
-
-/* =========================
+/* =========================================================
    LIVE TICKS
-========================= */
-
-function subscribeToTicks(symbol) {
-  if (
-    !socket ||
-    socket.readyState !== WebSocket.OPEN
-  ) {
-    return;
-  }
-
-  socket.send(JSON.stringify({
-    forget_all: "ticks",
-    req_id: 2
-  }));
-
-  socket.send(JSON.stringify({
-    ticks: symbol,
-    subscribe: 1,
-    req_id: 3
-  }));
-
-  setStatus("LIVE • " + symbol);
-}
+   ========================================================= */
 
 function handleTick(data) {
   if (!data.tick) return;
 
-  const price =
-    Number(data.tick.quote);
+  const tick = data.tick;
 
-  const epoch =
-    Number(data.tick.epoch) ||
-    Math.floor(Date.now() / 1000);
+  selectedPrice = safeNumber(tick.quote);
 
-  if (!Number.isFinite(price)) return;
-
-  updateLivePrice(price);
-
-  currentTicks.push({
-    time: epoch,
-    price: price
-  });
-
-  if (currentTicks.length > 1000) {
-    currentTicks.shift();
-  }
-
-  updateLiveCandle(price, epoch);
-
-  const now = Date.now();
-
-  if (now - lastAnalysisTime > 5000) {
-    lastAnalysisTime = now;
-    analyzeMarket();
-  }
-}
-
-function updateLivePrice(price) {
-  if (!priceElement) return;
-
-  priceElement.textContent =
-    formatPrice(price);
-}
-
-function formatPrice(price) {
-  if (price >= 1000) {
-    return price.toLocaleString(
-      undefined,
-      {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      }
-    );
-  }
-
-  if (price >= 100) {
-    return price.toFixed(2);
-  }
-
-  if (price >= 10) {
-    return price.toFixed(3);
-  }
-
-  if (price >= 1) {
-    return price.toFixed(5);
-  }
-
-  return price.toFixed(8);
-}
-
-
-/* =========================
-   HISTORICAL CANDLES
-========================= */
-
-function requestHistoricalCandles(symbol) {
-  if (
-    !socket ||
-    socket.readyState !== WebSocket.OPEN
-  ) {
-    return;
-  }
-
-  console.log(
-    "Requesting historical candles:",
-    symbol
+  setText(
+    "livePrice",
+    roundPrice(selectedPrice)
   );
 
-  socket.send(JSON.stringify({
-    ticks_history: symbol,
-    style: "candles",
-    granularity: 60,
-    count: 500,
-    end: "latest",
-    req_id: 10
-  }));
-}
-
-function handleHistory(data) {
-  if (!data) return;
-
-  const source =
-    data.candles ||
-    data.history?.candles;
-
-  if (!Array.isArray(source)) {
-    console.warn(
-      "No candle data returned."
-    );
-    return;
-  }
-
-  const parsed =
-    source
-      .map(function (candle) {
-        return {
-          time: Number(candle.epoch),
-          open: Number(candle.open),
-          high: Number(candle.high),
-          low: Number(candle.low),
-          close: Number(candle.close)
-        };
-      })
-      .filter(function (candle) {
-        return (
-          Number.isFinite(candle.open) &&
-          Number.isFinite(candle.high) &&
-          Number.isFinite(candle.low) &&
-          Number.isFinite(candle.close)
-        );
-      });
-
-  if (!parsed.length) return;
-
-  candles.M1 = parsed;
-
-  buildAllTimeframes();
-
-  console.log(
-    "M1 candles loaded:",
-    candles.M1.length
+  setText(
+    "marketName",
+    selectedSymbol || tick.symbol || "Market"
   );
 
-  analyzeMarket();
+  updateCurrentMinuteCandle(
+    selectedPrice,
+    safeNumber(tick.epoch)
+  );
 }
 
-
-/* =========================
-   BUILD TIMEFRAMES
-========================= */
-
-function buildAllTimeframes() {
-  candles.M5 =
-    aggregateCandles(
-      candles.M1,
-      5
-    );
-
-  candles.M15 =
-    aggregateCandles(
-      candles.M1,
-      15
-    );
-
-  candles.M30 =
-    aggregateCandles(
-      candles.M1,
-      30
-    );
-
-  candles.H1 =
-    aggregateCandles(
-      candles.M1,
-      60
-    );
-
-  candles.H2 =
-    aggregateCandles(
-      candles.M1,
-      120
-    );
-
-  candles.H4 =
-    aggregateCandles(
-      candles.M1,
-      240
-    );
-
-  candles.Daily =
-    aggregateCandles(
-      candles.M1,
-      1440
-    );
-}
-
-function aggregateCandles(
-  source,
-  minutes
-) {
-  if (!source.length) return [];
-
-  const result = [];
-  const interval =
-    minutes * 60;
-
-  let current = null;
-
-  source.forEach(function (candle) {
-    const bucket =
-      Math.floor(
-        candle.time / interval
-      ) * interval;
-
-    if (
-      !current ||
-      current.time !== bucket
-    ) {
-      current = {
-        time: bucket,
-        open: candle.open,
-        high: candle.high,
-        low: candle.low,
-        close: candle.close
-      };
-
-      result.push(current);
-    } else {
-      current.high =
-        Math.max(
-          current.high,
-          candle.high
-        );
-
-      current.low =
-        Math.min(
-          current.low,
-          candle.low
-        );
-
-      current.close =
-        candle.close;
-    }
-  });
-
-  return result;
-}
-
-
-/* =========================
-   LIVE CANDLE UPDATE
-========================= */
-
-function updateLiveCandle(
-  price,
-  epoch
-) {
-  if (!candles.M1.length) return;
-
+function updateCurrentMinuteCandle(price, epoch) {
   const minute =
     Math.floor(epoch / 60) * 60;
 
   let last =
-    candles.M1[
-      candles.M1.length - 1
-    ];
+    candles[candles.length - 1];
 
-  if (last.time === minute) {
-    last.high =
-      Math.max(
-        last.high,
-        price
-      );
-
-    last.low =
-      Math.min(
-        last.low,
-        price
-      );
-
-    last.close = price;
-  } else {
-    candles.M1.push({
+  if (!last || last.time !== minute) {
+    last = {
       time: minute,
       open: price,
       high: price,
       low: price,
       close: price
-    });
+    };
 
-    if (candles.M1.length > 1000) {
-      candles.M1.shift();
+    candles.push(last);
+
+    if (candles.length > 1200) {
+      candles.shift();
+    }
+  } else {
+    last.high =
+      Math.max(last.high, price);
+
+    last.low =
+      Math.min(last.low, price);
+
+    last.close = price;
+  }
+
+  analyzeProgressively();
+}
+
+/* =========================================================
+   TIMEFRAME AGGREGATION
+   ========================================================= */
+
+function aggregateCandles(source, minutes) {
+  if (minutes === 1) return [...source];
+
+  const result = [];
+  const bucketSize = minutes * 60;
+
+  for (const c of source) {
+    const bucket =
+      Math.floor(c.time / bucketSize) *
+      bucketSize;
+
+    let current =
+      result[result.length - 1];
+
+    if (!current || current.time !== bucket) {
+      current = {
+        time: bucket,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close
+      };
+
+      result.push(current);
+    } else {
+      current.high =
+        Math.max(current.high, c.high);
+
+      current.low =
+        Math.min(current.low, c.low);
+
+      current.close = c.close;
     }
   }
 
-  buildAllTimeframes();
+  return result;
 }
 
-
-/* =========================
+/* =========================================================
    SWING DETECTION
-========================= */
+   ========================================================= */
 
-function findSwingPoints(data) {
-  const swings = [];
-
-  if (data.length < 5) {
-    return swings;
-  }
+function detectSwings(data, left = 2, right = 2) {
+  const highs = [];
+  const lows = [];
 
   for (
-    let i = 2;
-    i < data.length - 2;
+    let i = left;
+    i < data.length - right;
     i++
   ) {
-    const c = data[i];
+    let high = true;
+    let low = true;
 
-    const isHigh =
-      c.high > data[i - 1].high &&
-      c.high > data[i - 2].high &&
-      c.high >= data[i + 1].high &&
-      c.high >= data[i + 2].high;
+    for (let j = 1; j <= left; j++) {
+      if (data[i].high <= data[i - j].high)
+        high = false;
 
-    const isLow =
-      c.low < data[i - 1].low &&
-      c.low < data[i - 2].low &&
-      c.low <= data[i + 1].low &&
-      c.low <= data[i + 2].low;
+      if (data[i].low >= data[i - j].low)
+        low = false;
+    }
 
-    if (isHigh) {
-      swings.push({
-        type: "HIGH",
-        price: c.high,
-        time: c.time,
-        index: i
+    for (let j = 1; j <= right; j++) {
+      if (data[i].high <= data[i + j].high)
+        high = false;
+
+      if (data[i].low >= data[i + j].low)
+        low = false;
+    }
+
+    if (high) {
+      highs.push({
+        index: i,
+        time: data[i].time,
+        price: data[i].high
       });
     }
 
-    if (isLow) {
-      swings.push({
-        type: "LOW",
-        price: c.low,
-        time: c.time,
-        index: i
+    if (low) {
+      lows.push({
+        index: i,
+        time: data[i].time,
+        price: data[i].low
       });
     }
   }
 
-  return swings;
+  return { highs, lows };
 }
 
-
-/* =========================
+/* =========================================================
    1H STRUCTURE
-========================= */
+   ========================================================= */
 
-function analyze1HStructure() {
-  const h1 = candles.H1;
+function get1HStructure() {
+  const h1 =
+    aggregateCandles(candles, 60);
 
-  if (h1.length < 10) {
+  if (h1.length < 20) {
     return {
-      direction: "UNKNOWN",
-      text: "Waiting for 1H structure"
+      direction: "NONE",
+      pivot: null,
+      previousPivot: null,
+      highs: [],
+      lows: []
     };
   }
 
   const swings =
-    findSwingPoints(h1);
+    detectSwings(h1, 2, 2);
 
-  const highs =
-    swings.filter(
-      s => s.type === "HIGH"
-    );
+  const recentHighs =
+    swings.highs.slice(-4);
 
-  const lows =
-    swings.filter(
-      s => s.type === "LOW"
-    );
+  const recentLows =
+    swings.lows.slice(-4);
 
   if (
-    highs.length < 2 ||
-    lows.length < 2
+    recentHighs.length < 2 ||
+    recentLows.length < 2
   ) {
     return {
-      direction: "UNKNOWN",
-      text: "1H swing confirmation pending"
-    };
-  }
-
-  const h1a =
-    highs[highs.length - 2];
-
-  const h1b =
-    highs[highs.length - 1];
-
-  const l1a =
-    lows[lows.length - 2];
-
-  const l1b =
-    lows[lows.length - 1];
-
-  if (
-    h1b.price > h1a.price &&
-    l1b.price > l1a.price
-  ) {
-    return {
-      direction: "BULLISH",
-      text:
-        "1H structure: Higher High + Higher Low"
-    };
-  }
-
-  if (
-    h1b.price < h1a.price &&
-    l1b.price < l1a.price
-  ) {
-    return {
-      direction: "BEARISH",
-      text:
-        "1H structure: Lower High + Lower Low"
-    };
-  }
-
-  return {
-    direction: "RANGE",
-    text:
-      "1H structure: Range / mixed swings"
-  };
-}
-
-
-/* =========================
-   SUPPORT & RESISTANCE
-========================= */
-
-function findSupportResistance(data) {
-  if (data.length < 5) {
-    return {
-      support: null,
-      resistance: null
-    };
-  }
-
-  const swings =
-    findSwingPoints(data);
-
-  const highs =
-    swings.filter(
-      s => s.type === "HIGH"
-    );
-
-  const lows =
-    swings.filter(
-      s => s.type === "LOW"
-    );
-
-  return {
-    support:
-      lows.length
-        ? lows[lows.length - 1].price
-        : null,
-
-    resistance:
-      highs.length
-        ? highs[highs.length - 1].price
-        : null
-  };
-}
-
-
-/* =========================
-   CANDLE CONFIRMATION
-========================= */
-
-function candleConfirmation(data) {
-  if (data.length < 3) {
-    return {
       direction: "NONE",
-      pattern: "Waiting",
-      strength: 0
+      pivot: null,
+      previousPivot: null,
+      highs: recentHighs,
+      lows: recentLows
     };
   }
 
-  const c =
-    data[data.length - 2];
+  const lastHigh =
+    recentHighs[recentHighs.length - 1];
 
-  const previous =
-    data[data.length - 3];
+  const previousHigh =
+    recentHighs[recentHighs.length - 2];
 
-  const body =
-    Math.abs(c.close - c.open);
+  const lastLow =
+    recentLows[recentLows.length - 1];
 
-  const range =
-    c.high - c.low;
-
-  if (range <= 0) {
-    return {
-      direction: "NONE",
-      pattern: "Neutral",
-      strength: 0
-    };
-  }
-
-  const upperWick =
-    c.high -
-    Math.max(c.open, c.close);
-
-  const lowerWick =
-    Math.min(c.open, c.close) -
-    c.low;
-
-  const bullish =
-    c.close > c.open;
-
-  const bearish =
-    c.close < c.open;
-
-  const strongBull =
-    bullish &&
-    body / range >= 0.60 &&
-    c.close > previous.high;
-
-  const strongBear =
-    bearish &&
-    body / range >= 0.60 &&
-    c.close < previous.low;
-
-  const bullishPin =
-    lowerWick > body * 2 &&
-    c.close > c.open;
-
-  const bearishPin =
-    upperWick > body * 2 &&
-    c.close < c.open;
-
-  if (strongBull) {
-    return {
-      direction: "BUY",
-      pattern: "Bullish Displacement",
-      strength: 3
-    };
-  }
-
-  if (strongBear) {
-    return {
-      direction: "SELL",
-      pattern: "Bearish Displacement",
-      strength: 3
-    };
-  }
-
-  if (bullishPin) {
-    return {
-      direction: "BUY",
-      pattern: "Bullish Rejection",
-      strength: 2
-    };
-  }
-
-  if (bearishPin) {
-    return {
-      direction: "SELL",
-      pattern: "Bearish Rejection",
-      strength: 2
-    };
-  }
-
-  return {
-    direction: "NONE",
-    pattern: "No candle confirmation",
-    strength: 0
-  };
-}
-
-
-/* =========================
-   A / B / C SETUP ENGINE
-========================= */
-
-function generateSetup() {
-  const tf =
-    timeframeSelect
-      ? timeframeSelect.value
-      : "M15";
-
-  const data =
-    candles[tf] || candles.M15;
-
-  if (data.length < 10) {
-    return {
-      setup: "C",
-      direction: "NONE",
-      confidence: 0,
-      reason:
-        "Not enough candle data"
-    };
-  }
-
-  const structure =
-    analyze1HStructure();
-
-  const sr =
-    findSupportResistance(data);
-
-  const candle =
-    candleConfirmation(data);
-
-  const price =
-    data[data.length - 1].close;
-
-  let score = 0;
+  const previousLow =
+    recentLows[recentLows.length - 2];
 
   let direction = "NONE";
 
   if (
-    structure.direction ===
-    candle.direction
+    lastHigh.price > previousHigh.price &&
+    lastLow.price > previousLow.price
   ) {
-    score += 4;
-    direction =
-      structure.direction === "BULLISH"
-        ? "BUY"
-        : "SELL";
+    direction = "BULLISH";
   }
 
   if (
-    candle.strength >= 2
+    lastHigh.price < previousHigh.price &&
+    lastLow.price < previousLow.price
   ) {
-    score += 2;
+    direction = "BEARISH";
   }
 
-  if (
-    direction === "BUY" &&
-    sr.support !== null &&
-    price >= sr.support
-  ) {
-    score += 2;
+  let pivot = null;
+
+  if (direction === "BULLISH") {
+    pivot = lastLow;
   }
 
-  if (
-    direction === "SELL" &&
-    sr.resistance !== null &&
-    price <= sr.resistance
-  ) {
-    score += 2;
-  }
-
-  let setup = "C";
-
-  if (score >= 8) {
-    setup = "A";
-  } else if (score >= 5) {
-    setup = "B";
-  }
-
-  if (
-    direction === "NONE" ||
-    structure.direction === "RANGE" ||
-    structure.direction === "UNKNOWN"
-  ) {
-    setup = "C";
+  if (direction === "BEARISH") {
+    pivot = lastHigh;
   }
 
   return {
-    setup,
     direction,
-    confidence: Math.min(
-      95,
-      score * 10
-    ),
-    structure,
-    candle,
-    support: sr.support,
-    resistance: sr.resistance,
-    price
+    pivot,
+    previousPivot:
+      direction === "BULLISH"
+        ? previousLow
+        : previousHigh,
+    highs: recentHighs,
+    lows: recentLows
   };
 }
 
+/* =========================================================
+   LIQUIDITY SWEEP
+   ========================================================= */
 
-/* =========================
-   TRADE LEVELS
-========================= */
+function detectLiquiditySweep(data, direction) {
+  if (data.length < 8) {
+    return null;
+  }
 
-function calculateTradeLevels(result) {
+  const recent =
+    data.slice(-8, -1);
+
+  const current =
+    data[data.length - 1];
+
+  const highest =
+    Math.max(...recent.map(c => c.high));
+
+  const lowest =
+    Math.min(...recent.map(c => c.low));
+
+  if (direction === "BULLISH") {
+    if (
+      current.low < lowest &&
+      current.close > lowest
+    ) {
+      return {
+        type: "SELL-SIDE LIQUIDITY SWEEP",
+        price: current.low,
+        time: current.time
+      };
+    }
+  }
+
+  if (direction === "BEARISH") {
+    if (
+      current.high > highest &&
+      current.close < highest
+    ) {
+      return {
+        type: "BUY-SIDE LIQUIDITY SWEEP",
+        price: current.high,
+        time: current.time
+      };
+    }
+  }
+
+  return null;
+}
+
+/* =========================================================
+   BOS / CHOCH
+   ========================================================= */
+
+function detectStructureBreak(data, direction) {
+  if (data.length < 10) {
+    return null;
+  }
+
+  const swings =
+    detectSwings(data, 2, 2);
+
   if (
-    result.direction === "NONE" ||
-    result.setup === "C"
+    swings.highs.length < 2 ||
+    swings.lows.length < 2
   ) {
     return null;
   }
 
-  const entry =
-    result.price;
+  const last =
+    data[data.length - 1];
 
-  const support =
-    result.support;
+  const previousHigh =
+    swings.highs[swings.highs.length - 2];
 
-  const resistance =
-    result.resistance;
+  const previousLow =
+    swings.lows[swings.lows.length - 2];
 
+  if (direction === "BULLISH") {
+    if (last.close > previousHigh.price) {
+      return {
+        type: "BOS",
+        direction: "BULLISH",
+        price: last.close,
+        time: last.time
+      };
+    }
+  }
+
+  if (direction === "BEARISH") {
+    if (last.close < previousLow.price) {
+      return {
+        type: "BOS",
+        direction: "BEARISH",
+        price: last.close,
+        time: last.time
+      };
+    }
+  }
+
+  return null;
+}
+
+/* =========================================================
+   DISPLACEMENT
+   ========================================================= */
+
+function detectDisplacement(data, direction) {
+  if (data.length < 5) return false;
+
+  const last =
+    data[data.length - 1];
+
+  const previous =
+    data[data.length - 2];
+
+  const range =
+    last.high - last.low;
+
+  const previousRange =
+    previous.high - previous.low;
+
+  if (previousRange <= 0) return false;
+
+  const strong =
+    range >= previousRange * 1.25;
+
+  if (!strong) return false;
+
+  if (
+    direction === "BULLISH" &&
+    last.close > last.open
+  ) {
+    return true;
+  }
+
+  if (
+    direction === "BEARISH" &&
+    last.close < last.open
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/* =========================================================
+   FVG
+   ========================================================= */
+
+function detectFVG(data, direction) {
+  if (data.length < 3) return null;
+
+  const a =
+    data[data.length - 3];
+
+  const b =
+    data[data.length - 2];
+
+  const c =
+    data[data.length - 1];
+
+  if (
+    direction === "BULLISH" &&
+    c.low > a.high
+  ) {
+    return {
+      type: "BULLISH FVG",
+      low: a.high,
+      high: c.low,
+      midpoint:
+        (a.high + c.low) / 2
+    };
+  }
+
+  if (
+    direction === "BEARISH" &&
+    c.high < a.low
+  ) {
+    return {
+      type: "BEARISH FVG",
+      low: c.high,
+      high: a.low,
+      midpoint:
+        (c.high + a.low) / 2
+    };
+  }
+
+  return null;
+}
+
+/* =========================================================
+   SUPPLY / DEMAND
+   ========================================================= */
+
+function detectSupplyDemand(data, direction) {
+  if (data.length < 5) return null;
+
+  const last =
+    data[data.length - 1];
+
+  const previous =
+    data[data.length - 2];
+
+  if (
+    direction === "BULLISH" &&
+    previous.close < previous.open &&
+    last.close > previous.high
+  ) {
+    return {
+      type: "DEMAND",
+      high: previous.high,
+      low: previous.low
+    };
+  }
+
+  if (
+    direction === "BEARISH" &&
+    previous.close > previous.open &&
+    last.close < previous.low
+  ) {
+    return {
+      type: "SUPPLY",
+      high: previous.high,
+      low: previous.low
+    };
+  }
+
+  return null;
+}
+
+/* =========================================================
+   CANDLE CONFIRMATION
+   ========================================================= */
+
+function candleConfirmation(data, direction) {
+  if (!data.length) return null;
+
+  const c =
+    data[data.length - 1];
+
+  const range =
+    c.high - c.low;
+
+  if (range <= 0) return null;
+
+  const body =
+    Math.abs(c.close - c.open);
+
+  const upperWick =
+    c.high - Math.max(c.open, c.close);
+
+  const lowerWick =
+    Math.min(c.open, c.close) - c.low;
+
+  if (direction === "BULLISH") {
+    if (
+      lowerWick > body * 1.2 &&
+      c.close > c.open
+    ) {
+      return "Bullish rejection";
+    }
+
+    if (
+      body / range > 0.65 &&
+      c.close > c.open
+    ) {
+      return "Bullish momentum candle";
+    }
+  }
+
+  if (direction === "BEARISH") {
+    if (
+      upperWick > body * 1.2 &&
+      c.close < c.open
+    ) {
+      return "Bearish rejection";
+    }
+
+    if (
+      body / range > 0.65 &&
+      c.close < c.open
+    ) {
+      return "Bearish momentum candle";
+    }
+  }
+
+  return null;
+}
+
+/* =========================================================
+   SUPPORT / RESISTANCE
+   ========================================================= */
+
+function detectSR(data) {
+  if (data.length < 10) return null;
+
+  const swings =
+    detectSwings(data, 2, 2);
+
+  const high =
+    swings.highs.at(-1);
+
+  const low =
+    swings.lows.at(-1);
+
+  return {
+    resistance: high
+      ? high.price
+      : null,
+
+    support: low
+      ? low.price
+      : null
+  };
+}
+
+/* =========================================================
+   PROGRESSIVE SETUP ENGINE
+   ========================================================= */
+
+function buildProgressiveSignal() {
+  if (candles.length < 50) {
+    return {
+      stage: "NONE",
+      direction: "NONE",
+      reason: "Waiting for sufficient market data."
+    };
+  }
+
+  const h1Structure =
+    get1HStructure();
+
+  if (
+    h1Structure.direction === "NONE" ||
+    !h1Structure.pivot
+  ) {
+    return {
+      stage: "NONE",
+      direction: "NONE",
+      reason:
+        "No confirmed 1H swing structure."
+    };
+  }
+
+  const tfMinutes =
+    TIMEFRAMES[selectedTimeframe] || 5;
+
+  const data =
+    aggregateCandles(
+      candles,
+      tfMinutes
+    );
+
+  if (data.length < 20) {
+    return {
+      stage: "NONE",
+      direction: "NONE",
+      reason:
+        "Waiting for enough candles on selected timeframe."
+    };
+  }
+
+  const direction =
+    h1Structure.direction;
+
+  const pivot =
+    h1Structure.pivot;
+
+  const current =
+    data[data.length - 1];
+
+  const sweep =
+    detectLiquiditySweep(
+      data,
+      direction
+    );
+
+  const bos =
+    detectStructureBreak(
+      data,
+      direction
+    );
+
+  const displacement =
+    detectDisplacement(
+      data,
+      direction
+    );
+
+  const fvg =
+    detectFVG(
+      data,
+      direction
+    );
+
+  const zone =
+    detectSupplyDemand(
+      data,
+      direction
+    );
+
+  const candle =
+    candleConfirmation(
+      data,
+      direction
+    );
+
+  const sr =
+    detectSR(data);
+
+  /*
+   ---------------------------------------------------------
+   PROGRESSIVE LOGIC
+
+   WATCH:
+   1H structure exists.
+
+   C:
+   Structure + price interaction/rejection/sweep/candle.
+
+   B:
+   Stronger structural confirmation.
+
+   A:
+   Multiple high-quality confirmations.
+
+   IMPORTANT:
+   The engine does NOT wait for A before producing a signal.
+   ---------------------------------------------------------
+  */
+
+  let stage = "WATCH";
+
+  const confirmations = [];
+
+  if (sweep) {
+    confirmations.push("Liquidity sweep");
+  }
+
+  if (bos) {
+    confirmations.push("BOS");
+  }
+
+  if (displacement) {
+    confirmations.push("Displacement");
+  }
+
+  if (fvg) {
+    confirmations.push("FVG");
+  }
+
+  if (zone) {
+    confirmations.push(zone.type);
+  }
+
+  if (candle) {
+    confirmations.push(candle);
+  }
+
+  /*
+   C SETUP
+   */
+  if (
+    sweep ||
+    candle ||
+    zone
+  ) {
+    stage = "C";
+  }
+
+  /*
+   B SETUP
+   */
+  if (
+    (sweep && bos) ||
+    (bos && displacement) ||
+    (sweep && candle && displacement)
+  ) {
+    stage = "B";
+  }
+
+  /*
+   A SETUP
+   */
+  if (
+    sweep &&
+    bos &&
+    displacement &&
+    (fvg || zone) &&
+    candle
+  ) {
+    stage = "A";
+  }
+
+  /*
+   Invalid / exhausted setup
+   */
+  const distanceFromPivot =
+    Math.abs(
+      current.close - pivot.price
+    );
+
+  const recentRange =
+    Math.max(
+      ...data
+        .slice(-10)
+        .map(c => c.high)
+    ) -
+    Math.min(
+      ...data
+        .slice(-10)
+        .map(c => c.low)
+    );
+
+  if (
+    recentRange > 0 &&
+    distanceFromPivot >
+      recentRange * 5
+  ) {
+    return {
+      stage: "NONE",
+      direction,
+      reason:
+        "Price has moved too far from the structural pivot."
+    };
+  }
+
+  /*
+   HIGH / MEDIUM / LOW QUALITY
+   */
+  let quality = "LOW";
+
+  if (stage === "B") {
+    quality = "MEDIUM";
+  }
+
+  if (stage === "A") {
+    quality = "HIGH";
+  }
+
+  if (stage === "C") {
+    quality = "LOW";
+  }
+
+  /*
+   ENTRY
+   */
+  let entry = current.close;
+
+  if (fvg) {
+    entry = fvg.midpoint;
+  } else if (zone) {
+    entry =
+      (zone.high + zone.low) / 2;
+  }
+
+  /*
+   STOP LOSS
+   */
   let sl;
+
+  if (direction === "BULLISH") {
+    sl =
+      sweep?.price ??
+      zone?.low ??
+      pivot.price;
+
+    sl -= recentRange * 0.05;
+  } else {
+    sl =
+      sweep?.price ??
+      zone?.high ??
+      pivot.price;
+
+    sl += recentRange * 0.05;
+  }
+
+  /*
+   TARGETS
+   */
+  const risk =
+    Math.abs(entry - sl);
+
+  if (risk <= 0) {
+    return {
+      stage: "NONE",
+      direction,
+      reason:
+        "Risk calculation invalid."
+    };
+  }
+
   let tp1;
   let tp2;
 
-  if (
-    result.direction === "BUY"
-  ) {
-    sl =
-      support !== null &&
-      support < entry
-        ? support
-        : entry * 0.998;
-
-    const risk =
-      entry - sl;
-
-    tp1 =
-      entry + risk * 2;
-
-    tp2 =
-      entry + risk * 3;
+  if (direction === "BULLISH") {
+    tp1 = entry + risk * 2;
+    tp2 = entry + risk * 3;
   } else {
-    sl =
-      resistance !== null &&
-      resistance > entry
-        ? resistance
-        : entry * 1.002;
-
-    const risk =
-      sl - entry;
-
-    tp1 =
-      entry - risk * 2;
-
-    tp2 =
-      entry - risk * 3;
+    tp1 = entry - risk * 2;
+    tp2 = entry - risk * 3;
   }
 
   return {
+    stage,
+    quality,
+    direction,
+    pivot,
     entry,
     sl,
     tp1,
     tp2,
-    rr1: "1:2",
-    rr2: "1:3"
+    rr: 3,
+    sweep,
+    bos,
+    displacement,
+    fvg,
+    zone,
+    candle,
+    sr,
+    confirmations,
+    reason:
+      confirmations.length
+        ? confirmations.join(" + ")
+        : "1H structural opportunity detected."
   };
 }
 
-
-/* =========================
-   UPDATE DASHBOARD
-========================= */
-
-function updateDashboard(
-  result,
-  levels
-) {
-  const signal =
-    document.getElementById(
-      "signal"
-    );
-
-  const direction =
-    document.getElementById(
-      "direction"
-    );
-
-  const setup =
-    document.getElementById(
-      "setup"
-    );
-
-  const confidence =
-    document.getElementById(
-      "confidence"
-    );
-
-  const rr =
-    document.getElementById(
-      "rr"
-    );
-
-  const explanation =
-    document.getElementById(
-      "explanationText"
-    );
-
-  const swing =
-    document.getElementById(
-      "swing"
-    );
-
-  const structure =
-    document.getElementById(
-      "structure"
-    );
-
-  const liquidity =
-    document.getElementById(
-      "liquidity"
-    );
-
-  const sr =
-    document.getElementById(
-      "sr"
-    );
-
-  const pattern =
-    document.getElementById(
-      "pattern"
-    );
-
-  const rejection =
-    document.getElementById(
-      "rejection"
-    );
-
-  const momentum =
-    document.getElementById(
-      "momentum"
-    );
-
-  const confirmation =
-    document.getElementById(
-      "confirmation"
-    );
-
-  if (result.setup === "C") {
-    if (signal)
-      signal.textContent =
-        "NO SETUP";
-
-    if (direction)
-      direction.textContent =
-        "WAIT";
-
-    if (setup)
-      setup.textContent =
-        "C / HIGH RISK";
-
-    if (confidence)
-      confidence.textContent =
-        result.confidence + "%";
-
-    if (rr)
-      rr.textContent =
-        "—";
-
-    if (explanation) {
-      explanation.textContent =
-        "No A/B-quality setup is currently confirmed. " +
-        "The engine is waiting for valid 1H structure, " +
-        "support/resistance and candle confirmation.";
-    }
-
-    return;
-  }
-
-  if (signal) {
-    signal.textContent =
-      result.direction;
-  }
-
-  if (direction) {
-    direction.textContent =
-      result.direction;
-  }
-
-  if (setup) {
-    setup.textContent =
-      result.setup + " SETUP";
-  }
-
-  if (confidence) {
-    confidence.textContent =
-      result.confidence + "%";
-  }
-
-  if (rr) {
-    rr.textContent =
-      "1:2 / 1:3";
-  }
-
-  if (levels) {
-    const entry =
-      document.getElementById("entry");
-
-    const sl =
-      document.getElementById("sl");
-
-    const tp1 =
-      document.getElementById("tp1");
-
-    const tp2 =
-      document.getElementById("tp2");
-
-    if (entry)
-      entry.textContent =
-        formatPrice(levels.entry);
-
-    if (sl)
-      sl.textContent =
-        formatPrice(levels.sl);
-
-    if (tp1)
-      tp1.textContent =
-        formatPrice(levels.tp1);
-
-    if (tp2)
-      tp2.textContent =
-        formatPrice(levels.tp2);
-  }
-
-  if (swing)
-    swing.textContent =
-      "1H swing confirmed";
-
-  if (structure)
-    structure.textContent =
-      result.structure.text;
-
-  if (liquidity)
-    liquidity.textContent =
-      "Swing liquidity monitored";
-
-  if (sr)
-    sr.textContent =
-      "S: " +
-      formatOptional(result.support) +
-      " / R: " +
-      formatOptional(result.resistance);
-
-  if (pattern)
-    pattern.textContent =
-      result.candle.pattern;
-
-  if (rejection)
-    rejection.textContent =
-      result.candle.strength >= 2
-        ? "Confirmed"
-        : "Waiting";
-
-  if (momentum)
-    momentum.textContent =
-      result.candle.strength === 3
-        ? "Strong"
-        : result.candle.strength === 2
-        ? "Moderate"
-        : "Weak";
-
-  if (confirmation)
-    confirmation.textContent =
-      "Confirmed";
-
-  if (explanation) {
-    explanation.textContent =
-      result.direction +
-      " setup detected from " +
-      result.setup +
-      "-grade conditions. " +
-      result.structure.text +
-      ". Candle confirmation: " +
-      result.candle.pattern +
-      ".";
-  }
-}
-
-function formatOptional(value) {
-  if (
-    value === null ||
-    value === undefined ||
-    !Number.isFinite(value)
-  ) {
-    return "—";
-  }
-
-  return formatPrice(value);
-}
-
-
-/* =========================
+/* =========================================================
    MAIN ANALYSIS
-========================= */
+   ========================================================= */
 
-function analyzeMarket() {
-  if (!selectedSymbol) {
-    return;
-  }
+function analyzeProgressively() {
+  if (!selectedSymbol) return;
 
   const result =
-    generateSetup();
+    buildProgressiveSignal();
 
-  const levels =
-    calculateTradeLevels(result);
+  currentSignal = result;
 
-  updateDashboard(
+  updateDashboard(result);
+  processAlert(result);
+}
+
+/* =========================================================
+   DASHBOARD UPDATE
+   ========================================================= */
+
+function updateDashboard(result) {
+  if (!result || result.stage === "NONE") {
+    setText("signal", "NO SETUP");
+    setText("direction", result?.direction || "NONE");
+    setText(
+      "setup",
+      result?.reason || "No valid setup."
+    );
+
+    setText("confidence", "-");
+    setText("rr", "-");
+
+    setText("entry", "-");
+    setText("sl", "-");
+    setText("tp1", "-");
+    setText("tp2", "-");
+
+    setText("swing", "-");
+    setText("structure", "-");
+    setText("liquidity", "-");
+    setText("sr", "-");
+
+    setText("pattern", "-");
+    setText("rejection", "-");
+    setText("momentum", "-");
+    setText("confirmation", "-");
+
+    return;
+  }
+
+  const arrow =
+    result.direction === "BULLISH"
+      ? "BUY"
+      : "SELL";
+
+  setText(
+    "signal",
+    `${arrow} — ${result.stage} SETUP`
+  );
+
+  setText(
+    "direction",
+    arrow
+  );
+
+  setText(
+    "setup",
+    result.reason
+  );
+
+  setText(
+    "confidence",
+    result.quality || "EARLY"
+  );
+
+  setText(
+    "rr",
+    `1:${result.rr}`
+  );
+
+  setText(
+    "entry",
+    roundPrice(result.entry)
+  );
+
+  setText(
+    "sl",
+    roundPrice(result.sl)
+  );
+
+  setText(
+    "tp1",
+    roundPrice(result.tp1)
+  );
+
+  setText(
+    "tp2",
+    roundPrice(result.tp2)
+  );
+
+  setText(
+    "swing",
+    result.pivot
+      ? roundPrice(result.pivot.price)
+      : "-"
+  );
+
+  setText(
+    "structure",
+    result.bos
+      ? result.bos.type
+      : `${result.direction} 1H STRUCTURE`
+  );
+
+  setText(
+    "liquidity",
+    result.sweep
+      ? result.sweep.type
+      : "Watching"
+  );
+
+  setText(
+    "sr",
+    result.sr
+      ? `S: ${roundPrice(result.sr.support)} | R: ${roundPrice(result.sr.resistance)}`
+      : "Watching"
+  );
+
+  setText(
+    "pattern",
+    result.candle || "Watching"
+  );
+
+  setText(
+    "rejection",
+    result.candle?.includes("rejection")
+      ? "YES"
+      : "Watching"
+  );
+
+  setText(
+    "momentum",
+    result.displacement
+      ? "CONFIRMED"
+      : "Watching"
+  );
+
+  setText(
+    "confirmation",
+    result.confirmations.length
+      ? result.confirmations.join(" → ")
+      : "Early setup"
+  );
+
+  updateExplanation(result);
+}
+
+/* =========================================================
+   EXPLANATION
+   ========================================================= */
+
+function updateExplanation(result) {
+  const box = $("explanationText");
+
+  if (!box) return;
+
+  const direction =
+    result.direction === "BULLISH"
+      ? "BUY"
+      : "SELL";
+
+  let html = `
+    <strong>${direction} ${result.stage} SETUP</strong><br><br>
+  `;
+
+  html += `
+    The signal is progressive. The bot does not wait for every
+    confirmation before notifying you.<br><br>
+  `;
+
+  html += `
+    <strong>1H Structure:</strong>
+    ${result.direction}<br>
+  `;
+
+  if (result.pivot) {
+    html += `
+      <strong>Structural Pivot:</strong>
+      ${roundPrice(result.pivot.price)}<br>
+    `;
+  }
+
+  if (result.sweep) {
+    html += `
+      <strong>Liquidity:</strong>
+      ${result.sweep.type}<br>
+    `;
+  }
+
+  if (result.bos) {
+    html += `
+      <strong>Structure Break:</strong>
+      BOS confirmed<br>
+    `;
+  }
+
+  if (result.displacement) {
+    html += `
+      <strong>Displacement:</strong>
+      Confirmed<br>
+    `;
+  }
+
+  if (result.fvg) {
+    html += `
+      <strong>FVG:</strong>
+      ${roundPrice(result.fvg.low)}
+      -
+      ${roundPrice(result.fvg.high)}<br>
+    `;
+  }
+
+  if (result.zone) {
+    html += `
+      <strong>Fresh Zone:</strong>
+      ${result.zone.type}<br>
+    `;
+  }
+
+  if (result.candle) {
+    html += `
+      <strong>Candle:</strong>
+      ${result.candle}<br>
+    `;
+  }
+
+  html += `<br>`;
+
+  if (result.stage === "WATCH") {
+    html += `
+      <strong>STATUS:</strong>
+      Early opportunity detected. Monitor for C/B/A confirmation.
+    `;
+  }
+
+  if (result.stage === "C") {
+    html += `
+      <strong>STATUS:</strong>
+      C setup detected. This is an early/high-risk opportunity.
+      Further confirmation can upgrade it.
+    `;
+  }
+
+  if (result.stage === "B") {
+    html += `
+      <strong>STATUS:</strong>
+      B setup confirmed. Structure and additional confirmation
+      are now aligned.
+    `;
+  }
+
+  if (result.stage === "A") {
+    html += `
+      <strong>STATUS:</strong>
+      A setup confirmed. Multiple conditions are aligned.
+    `;
+  }
+
+  box.innerHTML = html;
+}
+
+/* =========================================================
+   ALERT ENGINE
+   ========================================================= */
+
+function processAlert(result) {
+  if (!result) return;
+
+  if (result.stage === "NONE") {
+    return;
+  }
+
+  /*
+   IMPORTANT:
+   Alert only when the setup stage changes.
+
+   This prevents:
+   C C C C C C
+   on every tick.
+  */
+
+  const structureTime =
+    result.pivot?.time || "none";
+
+  const sweepTime =
+    result.sweep?.time || "none";
+
+  const bosTime =
+    result.bos?.time || "none";
+
+  const alertKey =
+    [
+      selectedSymbol,
+      result.direction,
+      structureTime,
+      sweepTime,
+      bosTime,
+      result.stage
+    ].join("|");
+
+  if (alertKey === lastAlertKey) {
+    return;
+  }
+
+  lastAlertKey = alertKey;
+
+  const title =
+    `${selectedSymbol} ${result.direction === "BULLISH" ? "BUY" : "SELL"} ${result.stage} SETUP`;
+
+  const message = `
+${result.stage} SETUP detected
+
+Market: ${selectedSymbol}
+Direction: ${result.direction === "BULLISH" ? "BUY" : "SELL"}
+
+Entry: ${roundPrice(result.entry)}
+SL: ${roundPrice(result.sl)}
+TP1: ${roundPrice(result.tp1)}
+TP2: ${roundPrice(result.tp2)}
+
+RR: 1:${result.rr}
+
+Reason:
+${result.reason}
+  `.trim();
+
+  showInAppAlert(title, message);
+  sendBrowserNotification(title, message);
+
+  addHistory(
     result,
-    levels
+    title
   );
+}
 
-  console.log(
-    "ANALYSIS RESULT:",
-    result
-  );
+/* =========================================================
+   IN-APP ALERT
+   ========================================================= */
 
-  if (levels) {
-    console.log(
-      "TRADE LEVELS:",
-      levels
+function showInAppAlert(title, message) {
+  console.log(title, message);
+
+  /*
+   If your HTML already contains an alert system,
+   this will use it where possible.
+  */
+
+  const alertBox =
+    document.getElementById("alertBox");
+
+  if (alertBox) {
+    alertBox.innerHTML = `
+      <strong>${title}</strong>
+      <br>
+      ${message.replace(/\n/g, "<br>")}
+    `;
+
+    alertBox.style.display = "block";
+  }
+}
+
+/* =========================================================
+   BROWSER NOTIFICATIONS
+   ========================================================= */
+
+function sendBrowserNotification(title, body) {
+  if (
+    typeof Notification === "undefined"
+  ) {
+    return;
+  }
+
+  if (Notification.permission === "granted") {
+    new Notification(title, {
+      body,
+      tag: `${selectedSymbol}-${title}`
+    });
+
+    return;
+  }
+
+  /*
+   Browsers often require notification permission
+   to be requested from a user interaction.
+  */
+
+  if (Notification.permission === "default") {
+    Notification.requestPermission()
+      .then(permission => {
+        if (permission === "granted") {
+          new Notification(title, {
+            body,
+            tag: `${selectedSymbol}-${title}`
+          });
+        }
+      })
+      .catch(() => {});
+  }
+}
+
+/* =========================================================
+   SIGNAL HISTORY
+   ========================================================= */
+
+function addHistory(result, title) {
+  const history =
+    $("signalHistory");
+
+  if (!history) return;
+
+  const item =
+    document.createElement("div");
+
+  item.className =
+    "history-item";
+
+  item.innerHTML = `
+    <strong>${title}</strong>
+    <br>
+    Entry: ${roundPrice(result.entry)}
+    <br>
+    SL: ${roundPrice(result.sl)}
+    |
+    TP1: ${roundPrice(result.tp1)}
+    |
+    TP2: ${roundPrice(result.tp2)}
+    <br>
+    ${result.reason}
+  `;
+
+  history.prepend(item);
+
+  while (history.children.length > 30) {
+    history.removeChild(
+      history.lastChild
     );
   }
 }
 
+/* =========================================================
+   TIMEFRAME BUTTONS
+   ========================================================= */
 
-/* =========================
-   TIMEFRAME
-========================= */
+document.querySelectorAll(
+  "[data-timeframe]"
+).forEach(button => {
+  button.addEventListener(
+    "click",
+    () => {
+      selectedTimeframe =
+        button.dataset.timeframe;
 
-if (timeframeSelect) {
-  timeframeSelect.addEventListener(
-    "change",
-    function () {
-      if (selectedTimeframeElement) {
-        selectedTimeframeElement.textContent =
-          this.value;
-      }
+      document.querySelectorAll(
+        "[data-timeframe]"
+      ).forEach(btn => {
+        btn.classList.remove("active");
+      });
 
-      analyzeMarket();
+      button.classList.add("active");
+
+      analyzeProgressively();
     }
   );
-}
+});
 
-
-/* =========================
+/* =========================================================
    ANALYZE BUTTON
-========================= */
+   ========================================================= */
+
+const analyzeButton =
+  document.getElementById("analyze");
 
 if (analyzeButton) {
   analyzeButton.addEventListener(
     "click",
-    function () {
-      analyzeMarket();
+    () => {
+      analyzeProgressively();
+
+      /*
+       User interaction makes this a good point
+       to request notification permission.
+      */
+
+      if (
+        typeof Notification !== "undefined" &&
+        Notification.permission === "default"
+      ) {
+        Notification.requestPermission()
+          .catch(() => {});
+      }
     }
   );
 }
 
-
-/* =========================
-   RECONNECT
-========================= */
-
-function reconnect() {
-  clearTimeout(reconnectTimer);
-
-  reconnectTimer =
-    setTimeout(function () {
-      connectDeriv();
-    }, reconnectDelay);
-
-  reconnectDelay =
-    Math.min(
-      reconnectDelay * 1.5,
-      30000
-    );
-}
-
-
-/* =========================
-   START
-========================= */
-
-console.log(
-  "SUCCESSFUL PINE SCRIPT STARTING..."
-);
+/* =========================================================
+   START ENGINE
+   ========================================================= */
 
 connectDeriv();
