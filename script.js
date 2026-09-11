@@ -6,21 +6,15 @@
    LIVE PUBLIC DERIV DATA
    CLOSED-CANDLE / NON-REPAINTING ANALYSIS
 
-   DYNAMIC TIMEFRAME ENGINE
-   ------------------------------------------------------------
-   The user's selected timeframe is ALWAYS the primary
-   analysis timeframe.
-
-   M1  -> M1 analysis
-   M5  -> M5 analysis
-   M15 -> M15 analysis
-   M30 -> M30 analysis
-   H1  -> H1 analysis
-   H2  -> H2 analysis
-   H4  -> H4 analysis
-   Daily -> Daily analysis
-
-   Higher timeframes are used only as context.
+   IMPORTANT:
+   - Selected timeframe is the actual execution timeframe.
+   - No hardcoded M5 analysis.
+   - Each symbol stores candles separately by timeframe.
+   - 1H is used as structural context, not forced execution TF.
+   - Progressive signals:
+       EARLY SETUP -> C -> B -> A -> A+
+   - Signals can appear before every confirmation is complete.
+   - No forced trades.
    ============================================================ */
 
 "use strict";
@@ -50,6 +44,8 @@ const CONFIG = {
 
   DUPLICATE_COOLDOWN: 60 * 60 * 1000,
 
+  STALE_DATA_MS: 120000,
+
   TIMEFRAMES: {
     M1: 60,
     M5: 300,
@@ -61,27 +57,28 @@ const CONFIG = {
     Daily: 86400
   },
 
-  TOP_DOWN: [
-    "Daily",
-    "H4",
-    "H2",
-    "H1",
-    "M30",
-    "M15",
+  TIMEFRAME_ORDER: [
+    "M1",
     "M5",
-    "M1"
+    "M15",
+    "M30",
+    "H1",
+    "H2",
+    "H4",
+    "Daily"
   ]
 };
 
 
 /* ============================================================
-   GLOBAL STATE
+   STATE
    ============================================================ */
 
 const state = {
   ws: null,
 
   connected: false,
+  connecting: false,
 
   reconnectTimer: null,
   reconnectDelay: CONFIG.RECONNECT_MIN,
@@ -95,27 +92,26 @@ const state = {
   livePrice: null,
 
   /*
-   * IMPORTANT:
-   * Candles are stored separately for every symbol AND TF.
-   *
-   * state.candles[symbol][timeframe]
-   */
+    CRITICAL:
+
+    candles[symbol][timeframe] = {
+      candles: [],
+      updatedAt: timestamp
+    }
+
+    This prevents M5 data from being reused for H1/H4/etc.
+  */
   candles: {},
+
+  historyRequests: new Map(),
+  pendingHistory: new Map(),
 
   ticks: {},
 
-  /*
-   * Request tracking prevents an H1 response from being
-   * accidentally interpreted as M5.
-   */
-  historyRequests: new Map(),
-
-  pendingHistory: new Map(),
-
   analysis: null,
 
-  lastSignal: null,
   lastSignalKey: "",
+  activeSignal: null,
 
   signalHistory: [],
 
@@ -123,13 +119,15 @@ const state = {
 
   analysisTimer: null,
 
-  analysisRunning: false,
-
   alertsEnabled: true,
 
   userInteracted: false,
 
-  activeSetup: null
+  loadingHistory: false,
+
+  analysisRunning: false,
+
+  requestId: 1000
 };
 
 
@@ -145,9 +143,9 @@ function $all(selector) {
   return Array.from(document.querySelectorAll(selector));
 }
 
-function setText(selector, value) {
+function text(selector, value) {
   const el = $(selector);
-  if (el) el.textContent = value == null ? "" : String(value);
+  if (el) el.textContent = value;
 }
 
 function safeNumber(value) {
@@ -155,107 +153,12 @@ function safeNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-function round(value, decimals = 5) {
-  const n = Number(value);
-
-  if (!Number.isFinite(n)) return null;
-
-  const factor = Math.pow(10, decimals);
-
-  return Math.round(n * factor) / factor;
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
-
-/* ============================================================
-   TIMEFRAME ENGINE
-   ============================================================ */
-
-function getSelectedTimeframe() {
-  let tf =
-    state.requestedTimeframe ||
-    state.selectedTimeframe ||
-    null;
-
-  /*
-   * Try UI controls as fallback.
-   */
-
-  if (!tf) {
-    const active = document.querySelector(
-      "[data-timeframe].active"
-    );
-
-    if (active) {
-      tf = active.dataset.timeframe;
-    }
-  }
-
-  if (!tf) {
-    const select =
-      $("#timeframe") ||
-      $("#timeframeSelect") ||
-      $("#timeframe-selector");
-
-    if (select) {
-      tf = select.value;
-    }
-  }
-
-  tf = String(tf || "M5").trim();
-
-  if (!CONFIG.TIMEFRAMES[tf]) {
-    console.warn(
-      `Invalid timeframe "${tf}". Falling back to M5.`
-    );
-
-    tf = "M5";
-  }
-
-  return tf;
-}
-
-
-function setSelectedTimeframe(tf) {
-  tf = String(tf || "").trim();
-
-  if (!CONFIG.TIMEFRAMES[tf]) {
-    console.warn(`Unsupported timeframe: ${tf}`);
-    return false;
-  }
-
-  state.selectedTimeframe = tf;
-  state.requestedTimeframe = tf;
-
-  /*
-   * Keep UI controls synchronized.
-   */
-
-  $all("[data-timeframe]").forEach(button => {
-    button.classList.toggle(
-      "active",
-      button.dataset.timeframe === tf
-    );
-  });
-
-  const select =
-    $("#timeframe") ||
-    $("#timeframeSelect") ||
-    $("#timeframe-selector");
-
-  if (select) {
-    select.value = tf;
-  }
-
-  updateTimeframeDisplay(tf);
-
-  return true;
-}
-
-
-function updateTimeframeDisplay(tf) {
-  setText("#selectedTimeframe", tf);
-  setText("#analysisTimeframe", tf);
-  setText("#signalTimeframe", tf);
+function now() {
+  return Date.now();
 }
 
 
@@ -265,82 +168,61 @@ function updateTimeframeDisplay(tf) {
 
 document.addEventListener("DOMContentLoaded", () => {
   initializeExistingUI();
-
   createQuestionBar();
-
   createAlertControl();
 
   connectDeriv();
 
-  /*
-   * Analyze periodically using the CURRENT selected timeframe.
-   */
   state.analysisTimer = setInterval(() => {
     runPrecisionAnalysis(false);
   }, CONFIG.ANALYSIS_INTERVAL);
+
+  updateChosenPairDisplay();
 });
 
 
 function initializeExistingUI() {
-  updateTimeframeDisplay(getSelectedTimeframe());
-
-  /*
-   * Market selector
-   */
   const market = $("#market");
 
   if (market) {
-    market.addEventListener("change", async event => {
-      const symbol = event.target.value;
+    market.addEventListener("change", async () => {
+      const symbol = market.value;
 
       if (!symbol) return;
 
-      state.selectedSymbol = symbol;
       state.userInteracted = true;
+      state.selectedSymbol = symbol;
 
-      ensureSymbolStorage(symbol);
+      state.activeSignal = null;
+      state.lastSignalKey = "";
+
+      updateChosenPairDisplay();
+      updateMarketName();
 
       subscribeToSymbol(symbol);
 
-      const tf = getSelectedTimeframe();
-
-      await loadRequiredTimeframes(symbol, tf);
-
-      await runPrecisionAnalysis(true);
-    });
-  }
-
-
-  /*
-   * Timeframe buttons
-   */
-  $all("[data-timeframe]").forEach(button => {
-    button.addEventListener("click", async () => {
-      const tf = button.dataset.timeframe;
-
-      if (!setSelectedTimeframe(tf)) return;
-
-      state.userInteracted = true;
-
-      if (!state.selectedSymbol) return;
-
-      /*
-       * Fetch the ACTUAL selected timeframe.
-       */
-      await ensureTimeframeData(
-        state.selectedSymbol,
-        tf,
+      await loadTimeframeHistory(
+        symbol,
+        getSelectedTimeframe(),
         true
       );
 
       await runPrecisionAnalysis(true);
     });
+  }
+
+  $all("[data-timeframe]").forEach(button => {
+    button.addEventListener("click", async () => {
+      const tf =
+        button.dataset.timeframe ||
+        button.textContent.trim();
+
+      if (!CONFIG.TIMEFRAMES[tf]) return;
+
+      await selectTimeframe(tf);
+    });
   });
 
-
-  /*
-   * Analyze button
-   */
   const analyzeButton =
     $("#analyze") ||
     $("#analyzeBtn") ||
@@ -349,9 +231,157 @@ function initializeExistingUI() {
   if (analyzeButton) {
     analyzeButton.addEventListener("click", async () => {
       state.userInteracted = true;
-
       await runPrecisionAnalysis(true);
     });
+  }
+}
+
+
+/* ============================================================
+   TIMEFRAME SYSTEM
+   ============================================================ */
+
+function getSelectedTimeframe() {
+  const tf = state.selectedTimeframe;
+
+  if (CONFIG.TIMEFRAMES[tf]) {
+    return tf;
+  }
+
+  return "M5";
+}
+
+
+async function selectTimeframe(tf) {
+  if (!CONFIG.TIMEFRAMES[tf]) return;
+
+  state.selectedTimeframe = tf;
+  state.requestedTimeframe = tf;
+  state.userInteracted = true;
+
+  /*
+    Immediately update UI.
+
+    This makes it obvious that the selected timeframe changed
+    even before Deriv finishes returning the candles.
+  */
+  updateTimeframeButtons();
+  updateChosenPairDisplay();
+
+  const symbol =
+    state.selectedSymbol ||
+    $("#market")?.value;
+
+  if (!symbol) {
+    setWaitingState(
+      `SELECT ${tf}`,
+      `Choose a market to analyze on ${tf}.`
+    );
+    return;
+  }
+
+  state.selectedSymbol = symbol;
+
+  updateMarketName();
+
+  try {
+    await loadTimeframeHistory(symbol, tf, true);
+    await runPrecisionAnalysis(true);
+  } catch (error) {
+    console.error("Timeframe analysis error:", error);
+
+    setWaitingState(
+      `WAIT — ${tf} DATA`,
+      `Waiting for ${symbol} ${tf} candle data.`
+    );
+  }
+}
+
+
+function updateTimeframeButtons() {
+  $all("[data-timeframe]").forEach(button => {
+    const tf =
+      button.dataset.timeframe ||
+      button.textContent.trim();
+
+    button.classList.toggle(
+      "active",
+      tf === getSelectedTimeframe()
+    );
+
+    button.setAttribute(
+      "aria-selected",
+      tf === getSelectedTimeframe() ? "true" : "false"
+    );
+  });
+}
+
+
+/* ============================================================
+   CHOSEN PAIR + TIMEFRAME DISPLAY
+   ============================================================ */
+
+function getMarketDisplayName(symbol) {
+  if (!symbol) return "Waiting...";
+
+  const found = state.symbols.find(
+    item => item.symbol === symbol
+  );
+
+  return found?.display_name ||
+    found?.name ||
+    symbol;
+}
+
+
+function updateChosenPairDisplay() {
+  const symbol =
+    state.selectedSymbol ||
+    $("#market")?.value ||
+    "";
+
+  const tf = getSelectedTimeframe();
+
+  const display = symbol
+    ? `${getMarketDisplayName(symbol)} — ${tf}`
+    : `Waiting — ${tf}`;
+
+  const ids = [
+    "#selectedMarket",
+    "#marketName",
+    "#chosenPair",
+    "#chosenMarket",
+    "#selectedPair"
+  ];
+
+  ids.forEach(selector => {
+    const el = $(selector);
+    if (el) el.textContent = display;
+  });
+
+  /*
+    Some existing layouts use the market card itself.
+  */
+  const marketCard =
+    document.querySelector(".market-name");
+
+  if (marketCard) {
+    marketCard.textContent = display;
+  }
+}
+
+
+function updateMarketName() {
+  updateChosenPairDisplay();
+
+  const symbol = state.selectedSymbol;
+  const tf = getSelectedTimeframe();
+
+  if (symbol) {
+    text(
+      "#marketLabel",
+      `${getMarketDisplayName(symbol)} — ${tf}`
+    );
   }
 }
 
@@ -361,70 +391,68 @@ function initializeExistingUI() {
    ============================================================ */
 
 function connectDeriv() {
-  if (state.ws) {
-    try {
-      state.ws.close();
-    } catch (_) {}
-  }
+  if (state.connecting) return;
 
-  updateConnectionUI("Connecting to Deriv...", false);
+  state.connecting = true;
 
-  const ws = new WebSocket(CONFIG.DERIV_WS);
+  updateConnectionUI(
+    false,
+    "Connecting to Deriv..."
+  );
 
-  state.ws = ws;
+  try {
+    state.ws = new WebSocket(CONFIG.DERIV_WS);
 
-  ws.addEventListener("open", async () => {
-    state.connected = true;
+    state.ws.onopen = () => {
+      state.connected = true;
+      state.connecting = false;
+      state.reconnectDelay = CONFIG.RECONNECT_MIN;
 
-    state.reconnectDelay = CONFIG.RECONNECT_MIN;
-
-    updateConnectionUI("LIVE", true);
-
-    requestActiveSymbols();
-  });
-
-
-  ws.addEventListener("message", event => {
-    try {
-      const data = JSON.parse(event.data);
-
-      handleDerivMessage(data);
-    } catch (error) {
-      console.error(
-        "Deriv message parse error:",
-        error
+      updateConnectionUI(
+        true,
+        "LIVE — Deriv Connected"
       );
-    }
-  });
 
+      requestActiveSymbols();
+    };
 
-  ws.addEventListener("error", error => {
-    console.error("Deriv WebSocket error:", error);
+    state.ws.onmessage = event => {
+      handleDerivMessage(event.data);
+    };
 
-    updateConnectionUI(
-      "Connection error",
-      false
-    );
-  });
+    state.ws.onerror = error => {
+      console.error("Deriv WebSocket error:", error);
+      updateConnectionUI(
+        false,
+        "Deriv connection error"
+      );
+    };
 
+    state.ws.onclose = () => {
+      state.connected = false;
+      state.connecting = false;
 
-  ws.addEventListener("close", () => {
+      updateConnectionUI(
+        false,
+        "Reconnecting to Deriv..."
+      );
+
+      scheduleReconnect();
+    };
+
+  } catch (error) {
+    console.error("WebSocket creation failed:", error);
+
     state.connected = false;
-
-    updateConnectionUI(
-      "Reconnecting...",
-      false
-    );
+    state.connecting = false;
 
     scheduleReconnect();
-  });
+  }
 }
 
 
 function scheduleReconnect() {
   if (state.reconnectTimer) return;
-
-  const delay = state.reconnectDelay;
 
   state.reconnectTimer = setTimeout(() => {
     state.reconnectTimer = null;
@@ -435,21 +463,59 @@ function scheduleReconnect() {
       state.reconnectDelay * 2,
       CONFIG.RECONNECT_MAX
     );
-  }, delay);
+  }, state.reconnectDelay);
 }
 
 
-function sendDeriv(payload) {
-  if (
-    !state.ws ||
-    state.ws.readyState !== WebSocket.OPEN
-  ) {
-    return false;
+function updateConnectionUI(connected, message) {
+  const dot = $(".status-dot");
+  const connectionText = $("#connectionText");
+
+  if (dot) {
+    dot.classList.toggle("connected", connected);
+    dot.classList.toggle("disconnected", !connected);
   }
 
-  state.ws.send(JSON.stringify(payload));
+  if (connectionText) {
+    connectionText.textContent = message;
+  }
+}
 
-  return true;
+
+/* ============================================================
+   DERIV REQUEST
+   ============================================================ */
+
+function sendDerivRequest(payload) {
+  return new Promise((resolve, reject) => {
+    if (
+      !state.ws ||
+      state.ws.readyState !== WebSocket.OPEN
+    ) {
+      reject(new Error("Deriv WebSocket is not connected."));
+      return;
+    }
+
+    const reqId = ++state.requestId;
+
+    const request = {
+      ...payload,
+      req_id: reqId
+    };
+
+    state.pendingHistory.set(reqId, {
+      resolve,
+      reject,
+      createdAt: now()
+    });
+
+    try {
+      state.ws.send(JSON.stringify(request));
+    } catch (error) {
+      state.pendingHistory.delete(reqId);
+      reject(error);
+    }
+  });
 }
 
 
@@ -458,68 +524,100 @@ function sendDeriv(payload) {
    ============================================================ */
 
 function requestActiveSymbols() {
-  sendDeriv({
-    active_symbols: "full",
-    req_id: 1
-  });
+  if (!state.ws) return;
+
+  const request = {
+    active_symbols: "brief",
+    req_id: ++state.requestId
+  };
+
+  state.ws.send(JSON.stringify(request));
 }
 
 
-function handleDerivMessage(data) {
+/* ============================================================
+   DERIV MESSAGE HANDLER
+   ============================================================ */
+
+function handleDerivMessage(raw) {
+  let data;
+
+  try {
+    data =
+      typeof raw === "string"
+        ? JSON.parse(raw)
+        : raw;
+  } catch (error) {
+    console.error("Invalid Deriv message:", error);
+    return;
+  }
+
   if (data.error) {
     console.error(
       "Deriv API error:",
       data.error
     );
-  }
 
+    const pending =
+      state.pendingHistory.get(data.req_id);
 
-  /*
-   * Active symbols
-   */
-  if (Array.isArray(data.active_symbols)) {
-    handleActiveSymbols(
-      data.active_symbols
-    );
+    if (pending) {
+      state.pendingHistory.delete(data.req_id);
+
+      pending.reject(
+        new Error(
+          data.error.message ||
+          "Deriv request failed."
+        )
+      );
+    }
 
     return;
   }
 
 
-  /*
-   * Tick
-   */
-  if (data.tick) {
-    handleTick(data.tick);
+  /* ----------------------------------------------------------
+     ACTIVE SYMBOLS
+     ---------------------------------------------------------- */
+
+  if (data.active_symbols) {
+    processActiveSymbols(
+      data.active_symbols
+    );
   }
 
 
-  /*
-   * Historical candles
-   */
-  if (Array.isArray(data.candles)) {
-    handleHistoricalCandles(
-      data.candles,
-      data.req_id
-    );
+  /* ----------------------------------------------------------
+     CANDLE HISTORY
+     ---------------------------------------------------------- */
+
+  if (data.candles) {
+    handleCandleResponse(data);
+  }
+
+
+  /* ----------------------------------------------------------
+     TICKS
+     ---------------------------------------------------------- */
+
+  if (data.tick) {
+    handleTick(data.tick);
   }
 }
 
 
 /* ============================================================
-   ACTIVE SYMBOL NORMALIZATION
+   SYMBOL NORMALIZATION
    ============================================================ */
 
 function normalizeSymbol(raw) {
-  if (!raw) return null;
-
   return {
     symbol:
       raw.underlying_symbol ||
       raw.symbol ||
       "",
 
-    displayName:
+    display_name:
       raw.underlying_symbol_name ||
       raw.display_name ||
       raw.symbol ||
@@ -528,45 +626,64 @@ function normalizeSymbol(raw) {
     type:
       raw.underlying_symbol_type ||
       raw.symbol_type ||
-      "unknown"
+      "other"
   };
 }
 
 
-function handleActiveSymbols(rawSymbols) {
+function processActiveSymbols(rawSymbols) {
   const normalized = rawSymbols
     .map(normalizeSymbol)
     .filter(item => item.symbol);
 
-  state.symbols = normalized;
+  const unique = new Map();
 
-  populateMarketSelector(normalized);
+  normalized.forEach(item => {
+    unique.set(item.symbol, item);
+  });
 
-  if (!state.selectedSymbol && normalized.length) {
+  state.symbols =
+    Array.from(unique.values());
+
+  populateMarketSelector();
+
+  const market = $("#market");
+
+  if (
+    !state.selectedSymbol &&
+    market?.value
+  ) {
+    state.selectedSymbol = market.value;
+  }
+
+  if (
+    !state.selectedSymbol &&
+    state.symbols.length
+  ) {
     state.selectedSymbol =
-      normalized[0].symbol;
+      state.symbols[0].symbol;
+  }
 
-    const market = $("#market");
-
+  if (state.selectedSymbol) {
     if (market) {
-      market.value = state.selectedSymbol;
+      market.value =
+        state.selectedSymbol;
     }
-
-    ensureSymbolStorage(
-      state.selectedSymbol
-    );
 
     subscribeToSymbol(
       state.selectedSymbol
     );
 
-    loadRequiredTimeframes(
+    loadTimeframeHistory(
       state.selectedSymbol,
-      getSelectedTimeframe()
+      getSelectedTimeframe(),
+      false
     ).then(() => {
       runPrecisionAnalysis(true);
     });
   }
+
+  updateChosenPairDisplay();
 }
 
 
@@ -574,96 +691,95 @@ function handleActiveSymbols(rawSymbols) {
    MARKET SELECTOR
    ============================================================ */
 
-function populateMarketSelector(symbols) {
-  const select = $("#market");
+function populateMarketSelector() {
+  const market = $("#market");
 
-  if (!select) return;
+  if (!market) return;
 
-  const previous =
+  const current =
     state.selectedSymbol ||
-    select.value;
+    market.value;
 
-  select.innerHTML = "";
+  market.innerHTML = "";
 
-  const grouped = {};
+  const groups = groupSymbols(
+    state.symbols
+  );
 
-  symbols.forEach(item => {
-    const type =
-      item.type || "Other";
-
-    if (!grouped[type]) {
-      grouped[type] = [];
-    }
-
-    grouped[type].push(item);
-  });
-
-
-  Object.keys(grouped)
+  Object.keys(groups)
     .sort()
-    .forEach(type => {
+    .forEach(groupName => {
       const group =
         document.createElement("optgroup");
 
-      group.label = formatCategory(type);
+      group.label = groupName;
 
-      grouped[type]
-        .sort((a, b) =>
-          a.displayName.localeCompare(
-            b.displayName
-          )
-        )
-        .forEach(item => {
-          const option =
-            document.createElement("option");
+      groups[groupName].forEach(item => {
+        const option =
+          document.createElement("option");
 
-          option.value = item.symbol;
+        option.value = item.symbol;
+        option.textContent =
+          item.display_name ||
+          item.symbol;
 
-          option.textContent =
-            item.displayName ||
-            item.symbol;
+        group.appendChild(option);
+      });
 
-          group.appendChild(option);
-        });
-
-      select.appendChild(group);
+      market.appendChild(group);
     });
 
-
-  if (
-    previous &&
-    symbols.some(x => x.symbol === previous)
-  ) {
-    select.value = previous;
-  } else if (symbols.length) {
-    select.value = symbols[0].symbol;
+  if (current) {
+    market.value = current;
   }
 }
 
 
-function formatCategory(value) {
-  return String(value || "Other")
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, c =>
-      c.toUpperCase()
-    );
-}
+function groupSymbols(symbols) {
+  const groups = {};
 
+  symbols.forEach(item => {
+    const type =
+      String(item.type || "").toLowerCase();
 
-/* ============================================================
-   SYMBOL STORAGE
-   ============================================================ */
+    let group = "Other";
 
-function ensureSymbolStorage(symbol) {
-  if (!symbol) return;
+    if (
+      type.includes("forex") ||
+      type.includes("fx")
+    ) {
+      group = "Forex";
+    } else if (
+      type.includes("crypto")
+    ) {
+      group = "Crypto";
+    } else if (
+      type.includes("metal")
+    ) {
+      group = "Metals";
+    } else if (
+      type.includes("synthetic")
+    ) {
+      group = "Deriv Synthetic Indices";
+    } else if (
+      type.includes("index") ||
+      type.includes("indices")
+    ) {
+      group = "Global Indices";
+    } else if (
+      type.includes("commodity")
+    ) {
+      group = "Commodities";
+    }
 
-  if (!state.candles[symbol]) {
-    state.candles[symbol] = {};
-  }
+    if (!groups[group]) {
+      groups[group] = [];
+    }
 
-  if (!state.ticks[symbol]) {
-    state.ticks[symbol] = [];
-  }
+    groups[group].push(item);
+  });
+
+  return groups;
 }
 
 
@@ -672,65 +788,93 @@ function ensureSymbolStorage(symbol) {
    ============================================================ */
 
 function subscribeToSymbol(symbol) {
-  if (!symbol) return;
-
-  ensureSymbolStorage(symbol);
-
-  /*
-   * Clear previous tick subscription.
-   */
-  sendDeriv({
-    forget_all: "ticks"
-  });
-
-  sendDeriv({
-    ticks: symbol,
-    subscribe: 1
-  });
-}
-
-
-function handleTick(tick) {
-  const symbol = tick.symbol;
-
-  if (!symbol) return;
-
-  const price = safeNumber(tick.quote);
-
-  if (price == null) return;
-
-  state.livePrice = price;
-
-  ensureSymbolStorage(symbol);
-
-  state.ticks[symbol].push({
-    time:
-      Number(tick.epoch) ||
-      Math.floor(Date.now() / 1000),
-
-    quote: price
-  });
-
-
-  /*
-   * Keep memory controlled.
-   */
-  if (state.ticks[symbol].length > 2000) {
-    state.ticks[symbol].splice(
-      0,
-      state.ticks[symbol].length - 2000
-    );
+  if (
+    !symbol ||
+    !state.ws ||
+    state.ws.readyState !== WebSocket.OPEN
+  ) {
+    return;
   }
 
+  try {
+    state.ws.send(
+      JSON.stringify({
+        forget_all: "ticks"
+      })
+    );
 
-  if (symbol === state.selectedSymbol) {
-    updatePriceUI(price);
+    state.ws.send(
+      JSON.stringify({
+        ticks: symbol,
+        subscribe: 1
+      })
+    );
+
+  } catch (error) {
+    console.error(
+      "Tick subscription error:",
+      error
+    );
   }
 }
 
 
 /* ============================================================
-   TIMEFRAME HISTORY REQUEST
+   LIVE TICKS
+   ============================================================ */
+
+function handleTick(tick) {
+  const symbol = tick.symbol;
+
+  const price = safeNumber(
+    tick.quote
+  );
+
+  if (!symbol || price === null) return;
+
+  state.ticks[symbol] = {
+    price,
+    epoch: tick.epoch || Math.floor(now() / 1000)
+  };
+
+  if (symbol === state.selectedSymbol) {
+    state.livePrice = price;
+
+    updateLivePrice(price);
+
+    /*
+      Update global state used by Question Bar.
+    */
+    window.currentPrice = price;
+
+    /*
+      Do not analyze on every tick.
+      The 5-second analysis timer handles this.
+    */
+  }
+}
+
+
+function updateLivePrice(price) {
+  const selectors = [
+    "#price",
+    "#livePrice",
+    "#currentPrice"
+  ];
+
+  selectors.forEach(selector => {
+    const el = $(selector);
+
+    if (el) {
+      el.textContent =
+        formatPrice(price);
+    }
+  });
+}
+
+
+/* ============================================================
+   EXACT TIMEFRAME HISTORY
    ============================================================ */
 
 async function loadTimeframeHistory(
@@ -738,196 +882,201 @@ async function loadTimeframeHistory(
   timeframe,
   force = false
 ) {
-  if (!symbol) return [];
+  if (!symbol) {
+    throw new Error("No symbol selected.");
+  }
 
   if (!CONFIG.TIMEFRAMES[timeframe]) {
     throw new Error(
-      `Invalid timeframe: ${timeframe}`
+      `Unsupported timeframe: ${timeframe}`
     );
   }
 
-  ensureSymbolStorage(symbol);
-
-  /*
-   * Don't unnecessarily reload existing data.
-   */
-  if (
-    !force &&
-    state.candles[symbol][timeframe] &&
-    state.candles[symbol][timeframe].length >= 50
-  ) {
-    return state.candles[symbol][timeframe];
+  if (!state.candles[symbol]) {
+    state.candles[symbol] = {};
   }
 
+  const existing =
+    state.candles[symbol][timeframe];
 
-  if (!state.connected) {
+  if (
+    !force &&
+    existing &&
+    existing.candles?.length &&
+    now() - existing.updatedAt <
+      CONFIG.STALE_DATA_MS
+  ) {
+    return existing.candles;
+  }
+
+  if (
+    !state.ws ||
+    state.ws.readyState !== WebSocket.OPEN
+  ) {
     throw new Error(
       "Deriv WebSocket is not connected."
     );
   }
 
-
-  /*
-   * Unique request ID.
-   *
-   * This is the critical fix for dynamic TF requests.
-   */
-  const reqId =
-    Date.now() +
-    Math.floor(Math.random() * 100000);
-
-
   const granularity =
     CONFIG.TIMEFRAMES[timeframe];
 
+  const reqId = ++state.requestId;
 
-  const promise = new Promise(
-    (resolve, reject) => {
-      state.pendingHistory.set(
-        reqId,
-        {
-          resolve,
-          reject
-        }
+  return new Promise((resolve, reject) => {
+    state.historyRequests.set(reqId, {
+      symbol,
+      timeframe,
+      granularity
+    });
+
+    state.pendingHistory.set(reqId, {
+      resolve,
+      reject,
+      createdAt: now()
+    });
+
+    const request = {
+      ticks_history: symbol,
+      style: "candles",
+      granularity,
+      count: CONFIG.HISTORY_COUNT,
+      end: "latest",
+      req_id: reqId
+    };
+
+    try {
+      state.ws.send(
+        JSON.stringify(request)
       );
-
-      state.historyRequests.set(
-        reqId,
-        {
-          symbol,
-          timeframe,
-          granularity
-        }
-      );
-
-
-      const sent = sendDeriv({
-        ticks_history: symbol,
-
-        style: "candles",
-
-        granularity,
-
-        count: CONFIG.HISTORY_COUNT,
-
-        end: "latest",
-
-        req_id: reqId
-      });
-
-
-      if (!sent) {
-        state.pendingHistory.delete(
-          reqId
-        );
-
-        state.historyRequests.delete(
-          reqId
-        );
-
-        reject(
-          new Error(
-            "Deriv WebSocket unavailable."
-          )
-        );
-      }
+    } catch (error) {
+      state.historyRequests.delete(reqId);
+      state.pendingHistory.delete(reqId);
+      reject(error);
     }
-  );
+  });
+}
 
+
+/* ============================================================
+   CANDLE RESPONSE
+   ============================================================ */
+
+function handleCandleResponse(data) {
+  const reqId = data.req_id;
+
+  const metadata =
+    state.historyRequests.get(reqId);
+
+  const pending =
+    state.pendingHistory.get(reqId);
 
   /*
-   * Prevent a permanently pending request.
-   */
-  const timeout = new Promise(
-    (_, reject) => {
-      setTimeout(() => {
-        reject(
-          new Error(
-            `Timeout loading ${timeframe} data`
-          )
-        );
-      }, 15000);
-    }
+    NEVER use the currently selected UI timeframe
+    to interpret a response.
+
+    We use the timeframe that belonged to the
+    actual request.
+  */
+  if (!metadata) {
+    console.warn(
+      "Received candle response without metadata:",
+      reqId
+    );
+    return;
+  }
+
+  const {
+    symbol,
+    timeframe
+  } = metadata;
+
+  const candles = normalizeCandles(
+    data.candles || []
   );
 
+  if (!state.candles[symbol]) {
+    state.candles[symbol] = {};
+  }
 
-  try {
-    return await Promise.race([
-      promise,
-      timeout
-    ]);
-  } catch (error) {
+  state.candles[symbol][timeframe] = {
+    candles,
+    updatedAt: now()
+  };
+
+  state.historyRequests.delete(reqId);
+
+  if (pending) {
     state.pendingHistory.delete(reqId);
-    state.historyRequests.delete(reqId);
-
-    throw error;
+    pending.resolve(candles);
   }
 }
 
 
 /* ============================================================
-   LOAD REQUIRED TIMEFRAMES
+   NORMALIZE CANDLES
    ============================================================ */
 
-async function loadRequiredTimeframes(
-  symbol,
-  selectedTF
-) {
-  if (!symbol) return;
-
-  selectedTF =
-    selectedTF || getSelectedTimeframe();
-
-  /*
-   * Primary selected TF MUST be included.
-   */
-
-  const required = new Set([
-    selectedTF
-  ]);
-
-
-  /*
-   * Top-down context.
-   *
-   * These do not replace the selected timeframe.
-   */
-  CONFIG.TOP_DOWN.forEach(tf => {
-    required.add(tf);
-  });
-
-
-  /*
-   * Do not request unsupported duplicates.
-   */
-
-  const timeframes =
-    Array.from(required)
-      .filter(tf =>
-        CONFIG.TIMEFRAMES[tf]
-      );
-
-
-  setAnalysisStatus(
-    `Loading ${selectedTF} + market context...`
-  );
-
-
-  /*
-   * Load in parallel.
-   */
-  await Promise.allSettled(
-    timeframes.map(tf =>
-      ensureTimeframeData(
-        symbol,
-        tf,
-        false
-      )
+function normalizeCandles(rawCandles) {
+  return rawCandles
+    .map(c => ({
+      epoch: safeNumber(c.epoch),
+      open: safeNumber(c.open),
+      high: safeNumber(c.high),
+      low: safeNumber(c.low),
+      close: safeNumber(c.close)
+    }))
+    .filter(
+      c =>
+        c.epoch !== null &&
+        c.open !== null &&
+        c.high !== null &&
+        c.low !== null &&
+        c.close !== null
     )
-  );
+    .sort(
+      (a, b) => a.epoch - b.epoch
+    );
+}
 
 
-  return timeframes;
+/* ============================================================
+   EXACT CLOSED CANDLES
+   ============================================================ */
+
+function getClosedCandles(
+  symbol,
+  timeframe
+) {
+  if (!symbol) return [];
+
+  const bucket =
+    state.candles[symbol]?.[timeframe];
+
+  if (!bucket?.candles?.length) {
+    return [];
+  }
+
+  const duration =
+    CONFIG.TIMEFRAMES[timeframe];
+
+  const candles =
+    bucket.candles.slice();
+
+  const currentEpoch =
+    Math.floor(now() / 1000);
+
+  /*
+    Remove the candle that is still forming.
+
+    This keeps the analysis non-repainting.
+  */
+  return candles.filter(c => {
+    const candleEnd =
+      c.epoch + duration;
+
+    return candleEnd <= currentEpoch;
+  });
 }
 
 
@@ -940,208 +1089,31 @@ async function ensureTimeframeData(
   timeframe,
   force = false
 ) {
-  ensureSymbolStorage(symbol);
-
   const existing =
-    state.candles[symbol][timeframe];
-
+    state.candles[symbol]?.[timeframe];
 
   if (
     !force &&
-    Array.isArray(existing) &&
-    existing.length >= 50
+    existing?.candles?.length &&
+    now() - existing.updatedAt <
+      CONFIG.STALE_DATA_MS
   ) {
-    return existing;
-  }
-
-
-  try {
-    return await loadTimeframeHistory(
+    return getClosedCandles(
       symbol,
-      timeframe,
-      force
+      timeframe
     );
-  } catch (error) {
-    console.error(
-      `Failed to load ${timeframe}:`,
-      error
-    );
-
-    return [];
-  }
-}
-
-
-/* ============================================================
-   HANDLE HISTORICAL CANDLES
-   ============================================================ */
-
-function handleHistoricalCandles(
-  rawCandles,
-  reqId
-) {
-  if (!Array.isArray(rawCandles)) {
-    return;
   }
 
+  await loadTimeframeHistory(
+    symbol,
+    timeframe,
+    force
+  );
 
-  const request =
-    state.historyRequests.get(reqId);
-
-
-  /*
-   * If request metadata exists, use it.
-   *
-   * NEVER infer timeframe from the currently selected UI.
-   */
-  if (!request) {
-    console.warn(
-      "Received candle response without request metadata:",
-      reqId
-    );
-
-    return;
-  }
-
-
-  const {
+  return getClosedCandles(
     symbol,
     timeframe
-  } = request;
-
-
-  ensureSymbolStorage(symbol);
-
-
-  const candles = rawCandles
-    .map(normalizeCandle)
-    .filter(Boolean)
-    .sort(
-      (a, b) => a.time - b.time
-    );
-
-
-  state.candles[symbol][timeframe] =
-    candles;
-
-
-  /*
-   * Resolve waiting Promise.
-   */
-
-  const pending =
-    state.pendingHistory.get(reqId);
-
-
-  if (pending) {
-    pending.resolve(candles);
-
-    state.pendingHistory.delete(reqId);
-  }
-
-
-  state.historyRequests.delete(reqId);
-
-
-  /*
-   * Keep selected timeframe exposed globally.
-   */
-  if (
-    symbol === state.selectedSymbol &&
-    timeframe === getSelectedTimeframe()
-  ) {
-    window.closedCandles =
-      getClosedCandles(
-        symbol,
-        timeframe
-      );
-  }
-}
-
-
-function normalizeCandle(candle) {
-  if (!candle) return null;
-
-  const time =
-    Number(candle.epoch ?? candle.time);
-
-  const open =
-    safeNumber(candle.open);
-
-  const high =
-    safeNumber(candle.high);
-
-  const low =
-    safeNumber(candle.low);
-
-  const close =
-    safeNumber(candle.close);
-
-  if (
-    !Number.isFinite(time) ||
-    open == null ||
-    high == null ||
-    low == null ||
-    close == null
-  ) {
-    return null;
-  }
-
-  return {
-    time,
-    open,
-    high,
-    low,
-    close
-  };
-}
-
-
-/* ============================================================
-   CLOSED CANDLES
-   ============================================================ */
-
-function getClosedCandles(
-  symbol,
-  timeframe
-) {
-  if (!symbol) return [];
-
-  ensureSymbolStorage(symbol);
-
-  const candles =
-    state.candles[symbol][timeframe] ||
-    [];
-
-
-  if (!candles.length) {
-    return [];
-  }
-
-
-  const tfSeconds =
-    CONFIG.TIMEFRAMES[timeframe];
-
-
-  const now =
-    Math.floor(Date.now() / 1000);
-
-
-  /*
-   * Remove current open candle.
-   *
-   * This keeps analysis closed-candle based.
-   */
-  return candles.filter(candle => {
-    const start =
-      Math.floor(
-        candle.time / tfSeconds
-      ) * tfSeconds;
-
-    return (
-      start + tfSeconds <= now
-    );
-  });
+  );
 }
 
 
@@ -1150,206 +1122,122 @@ function getClosedCandles(
    ============================================================ */
 
 function detectSwings(candles) {
-  const swings = [];
+  const highs = [];
+  const lows = [];
 
-  if (!Array.isArray(candles)) {
-    return swings;
+  if (candles.length < 7) {
+    return { highs, lows };
   }
 
-  if (candles.length < 10) {
-    return swings;
-  }
-
-
-  const depth =
-    Math.min(
-      CONFIG.DEPTH,
-      Math.floor(
-        candles.length / 4
-      )
-    );
-
-
-  const deviation =
-    getDeviation(candles);
-
-
-  const step =
-    Math.max(
-      2,
-      Math.floor(
-        CONFIG.BACKSTEP / 2
-      )
-    );
-
+  const depth = 3;
 
   for (
     let i = depth;
     i < candles.length - depth;
-    i += step
+    i++
   ) {
-    const current =
-      candles[i];
+    const current = candles[i];
 
-
-    let isHigh = true;
-    let isLow = true;
-
+    let swingHigh = true;
+    let swingLow = true;
 
     for (
-      let j = i - depth;
-      j <= i + depth;
+      let j = 1;
+      j <= depth;
       j++
     ) {
-      if (j === i) continue;
-
       if (
-        candles[j].high >=
-        current.high
+        current.high <=
+          candles[i - j].high ||
+        current.high <=
+          candles[i + j].high
       ) {
-        isHigh = false;
+        swingHigh = false;
       }
 
       if (
-        candles[j].low <=
-        current.low
+        current.low >=
+          candles[i - j].low ||
+        current.low >=
+          candles[i + j].low
       ) {
-        isLow = false;
-      }
-
-      if (
-        !isHigh &&
-        !isLow
-      ) {
-        break;
+        swingLow = false;
       }
     }
 
-
-    if (
-      isHigh &&
-      current.high - current.low >=
-        deviation
-    ) {
-      swings.push({
-        type: "HIGH",
+    if (swingHigh) {
+      highs.push({
+        index: i,
         price: current.high,
-        time: current.time,
-        index: i
+        epoch: current.epoch
       });
     }
 
-
-    if (
-      isLow &&
-      current.high - current.low >=
-        deviation
-    ) {
-      swings.push({
-        type: "LOW",
+    if (swingLow) {
+      lows.push({
+        index: i,
         price: current.low,
-        time: current.time,
-        index: i
+        epoch: current.epoch
       });
     }
   }
 
-
-  return swings
-    .sort((a, b) =>
-      a.time - b.time
-    )
-    .slice(-100);
+  return {
+    highs: highs.slice(-CONFIG.SWING_LOOKBACK),
+    lows: lows.slice(-CONFIG.SWING_LOOKBACK)
+  };
 }
 
 
 /* ============================================================
-   VOLATILITY / DEVIATION
+   STRUCTURE CLASSIFICATION
    ============================================================ */
 
-function getAverageRange(
-  candles,
-  count = 50
-) {
-  if (!candles.length) return 0;
+function classifyStructure(candles) {
+  const swings = detectSwings(candles);
 
-  const sample =
-    candles.slice(-count);
-
-  const total =
-    sample.reduce(
-      (sum, c) =>
-        sum + Math.abs(
-          c.high - c.low
-        ),
-      0
-    );
-
-  return total / sample.length;
-}
-
-
-function getDeviation(candles) {
-  const avg =
-    getAverageRange(
-      candles,
-      50
-    );
-
-  return avg *
-    (CONFIG.DEVIATION / 5);
-}
-
-
-/* ============================================================
-   MARKET STRUCTURE
-   ============================================================ */
-
-function classifyStructure(
-  swings
-) {
-  const highs =
-    swings.filter(
-      s => s.type === "HIGH"
-    );
-
-  const lows =
-    swings.filter(
-      s => s.type === "LOW"
-    );
-
-
-  let highLabels = [];
-  let lowLabels = [];
-
+  const highLabels = [];
+  const lowLabels = [];
 
   for (
     let i = 1;
-    i < highs.length;
+    i < swings.highs.length;
     i++
   ) {
-    highLabels.push(
-      highs[i].price >
-      highs[i - 1].price
-        ? "HH"
-        : "LH"
-    );
-  }
+    const previous =
+      swings.highs[i - 1];
 
+    const current =
+      swings.highs[i];
+
+    highLabels.push({
+      type:
+        current.price > previous.price
+          ? "HH"
+          : "LH",
+      price: current.price
+    });
+  }
 
   for (
     let i = 1;
-    i < lows.length;
+    i < swings.lows.length;
     i++
   ) {
-    lowLabels.push(
-      lows[i].price >
-      lows[i - 1].price
-        ? "HL"
-        : "LL"
-    );
-  }
+    const previous =
+      swings.lows[i - 1];
 
+    const current =
+      swings.lows[i];
+
+    lowLabels.push({
+      type:
+        current.price > previous.price
+          ? "HL"
+          : "LL",
+      price: current.price
+    });
+  }
 
   const recentHighs =
     highLabels.slice(-3);
@@ -1357,68 +1245,66 @@ function classifyStructure(
   const recentLows =
     lowLabels.slice(-3);
 
-
   const bullish =
-    recentHighs.includes("HH") &&
-    recentLows.includes("HL");
-
+    recentHighs.filter(
+      x => x.type === "HH"
+    ).length +
+    recentLows.filter(
+      x => x.type === "HL"
+    ).length;
 
   const bearish =
-    recentHighs.includes("LH") &&
-    recentLows.includes("LL");
-
+    recentHighs.filter(
+      x => x.type === "LH"
+    ).length +
+    recentLows.filter(
+      x => x.type === "LL"
+    ).length;
 
   let bias = "NEUTRAL";
 
-  if (bullish && !bearish) {
+  if (bullish > bearish) {
     bias = "BULLISH";
-  } else if (
-    bearish &&
-    !bullish
-  ) {
+  } else if (bearish > bullish) {
     bias = "BEARISH";
   }
-
 
   return {
     bias,
 
-    highs,
-
-    lows,
-
     highLabels,
-
     lowLabels,
 
+    highs: swings.highs,
+    lows: swings.lows,
+
     latestHigh:
-      highs[highs.length - 1] ||
-      null,
+      swings.highs.at(-1) || null,
 
     previousHigh:
-      highs[highs.length - 2] ||
-      null,
+      swings.highs.at(-2) || null,
 
     latestLow:
-      lows[lows.length - 1] ||
-      null,
+      swings.lows.at(-1) || null,
 
     previousLow:
-      lows[lows.length - 2] ||
-      null
+      swings.lows.at(-2) || null
   };
 }
 
 
 /* ============================================================
-   BOS / CHOCH
+   STRUCTURE EVENTS
    ============================================================ */
 
-function detectStructureEvents(
-  candles,
-  structure
-) {
-  if (!candles.length) {
+function detectStructureEvents(candles) {
+  const structure =
+    classifyStructure(candles);
+
+  const latest =
+    candles.at(-1);
+
+  if (!latest) {
     return {
       bos: null,
       choch: null,
@@ -1426,78 +1312,48 @@ function detectStructureEvents(
     };
   }
 
+  const previousHigh =
+    structure.previousHigh;
 
-  const last =
-    candles[candles.length - 1];
-
+  const previousLow =
+    structure.previousLow;
 
   let bos = null;
   let choch = null;
-  let direction = null;
-
-
-  const previousHigh =
-    structure.previousHigh ||
-    structure.latestHigh;
-
-
-  const previousLow =
-    structure.previousLow ||
-    structure.latestLow;
-
 
   if (
     previousHigh &&
-    last.close >
-      previousHigh.price
+    latest.close > previousHigh.price
   ) {
-    direction = "BULLISH";
-
-    bos = {
-      type: "BOS",
-      direction: "BULLISH",
-      level: previousHigh.price
-    };
+    bos = "BULLISH";
 
     if (
       structure.bias === "BEARISH"
     ) {
-      choch = {
-        type: "CHoCH",
-        direction: "BULLISH"
-      };
+      choch = "BULLISH";
     }
   }
 
-
   if (
     previousLow &&
-    last.close <
-      previousLow.price
+    latest.close < previousLow.price
   ) {
-    direction = "BEARISH";
-
-    bos = {
-      type: "BOS",
-      direction: "BEARISH",
-      level: previousLow.price
-    };
+    bos = "BEARISH";
 
     if (
       structure.bias === "BULLISH"
     ) {
-      choch = {
-        type: "CHoCH",
-        direction: "BEARISH"
-      };
+      choch = "BEARISH";
     }
   }
-
 
   return {
     bos,
     choch,
-    direction
+    direction:
+      bos ||
+      choch ||
+      null
   };
 }
 
@@ -1506,102 +1362,54 @@ function detectStructureEvents(
    LIQUIDITY
    ============================================================ */
 
-function detectLiquidity(
-  candles,
-  structure
-) {
-  if (
-    candles.length < 2
-  ) {
+function detectLiquidity(candles) {
+  const structure =
+    classifyStructure(candles);
+
+  const latest =
+    candles.at(-1);
+
+  if (!latest) {
     return {
-      swept: false,
-      direction: null,
-      level: null
+      sweep: false,
+      direction: null
     };
   }
 
+  const high =
+    structure.latestHigh;
 
-  const last =
-    candles[candles.length - 1];
+  const low =
+    structure.latestLow;
 
-
-  const previous =
-    candles
-      .slice(
-        Math.max(
-          0,
-          candles.length - 20
-        ),
-        -1
-      );
-
-
-  const highs =
-    previous.map(
-      c => c.high
-    );
-
-  const lows =
-    previous.map(
-      c => c.low
-    );
-
-
-  const liquidityHigh =
-    Math.max(
-      ...highs
-    );
-
-
-  const liquidityLow =
-    Math.min(
-      ...lows
-    );
-
-
-  /*
-   * Buy-side liquidity swept:
-   * price trades above high and closes back below.
-   */
   if (
-    last.high >
-      liquidityHigh &&
-    last.close <
-      liquidityHigh
+    high &&
+    latest.high > high.price &&
+    latest.close < high.price
   ) {
     return {
-      swept: true,
-      direction: "BEARISH",
-      type: "BUY-SIDE SWEEP",
-      level: liquidityHigh
+      sweep: true,
+      direction: "SELL",
+      type: "BUY-SIDE LIQUIDITY SWEEP"
     };
   }
 
-
-  /*
-   * Sell-side liquidity swept:
-   * price trades below low and closes back above.
-   */
   if (
-    last.low <
-      liquidityLow &&
-    last.close >
-      liquidityLow
+    low &&
+    latest.low < low.price &&
+    latest.close > low.price
   ) {
     return {
-      swept: true,
-      direction: "BULLISH",
-      type: "SELL-SIDE SWEEP",
-      level: liquidityLow
+      sweep: true,
+      direction: "BUY",
+      type: "SELL-SIDE LIQUIDITY SWEEP"
     };
   }
-
 
   return {
-    swept: false,
+    sweep: false,
     direction: null,
-    type: null,
-    level: null
+    type: null
   };
 }
 
@@ -1610,57 +1418,29 @@ function detectLiquidity(
    SUPPORT / RESISTANCE
    ============================================================ */
 
-function detectSupportResistance(
-  candles,
-  swings
-) {
-  if (!candles.length) {
-    return {
-      support: null,
-      resistance: null
-    };
-  }
+function detectSupportResistance(candles) {
+  const structure =
+    classifyStructure(candles);
 
+  const supports =
+    structure.lows
+      .slice(-5)
+      .map(x => x.price);
 
-  const lows =
-    swings
-      .filter(
-        s => s.type === "LOW"
-      )
-      .slice(-5);
-
-
-  const highs =
-    swings
-      .filter(
-        s => s.type === "HIGH"
-      )
-      .slice(-5);
-
-
-  const support =
-    lows.length
-      ? Math.min(
-          ...lows.map(
-            s => s.price
-          )
-        )
-      : null;
-
-
-  const resistance =
-    highs.length
-      ? Math.max(
-          ...highs.map(
-            s => s.price
-          )
-        )
-      : null;
-
+  const resistances =
+    structure.highs
+      .slice(-5)
+      .map(x => x.price);
 
   return {
-    support,
-    resistance
+    supports,
+    resistances,
+
+    support:
+      supports.at(-1) ?? null,
+
+    resistance:
+      resistances.at(-1) ?? null
   };
 }
 
@@ -1669,91 +1449,45 @@ function detectSupportResistance(
    SUPPLY / DEMAND
    ============================================================ */
 
-function detectSupplyDemand(
-  candles
-) {
-  if (
-    candles.length < 10
-  ) {
+function detectSupplyDemand(candles) {
+  if (candles.length < 5) {
     return {
-      demand: null,
-      supply: null
+      supply: null,
+      demand: null
     };
   }
 
+  const recent =
+    candles.slice(-20);
 
-  const avgRange =
-    getAverageRange(
-      candles,
-      30
+  let supply = null;
+  let demand = null;
+
+  const highest =
+    Math.max(
+      ...recent.map(c => c.high)
     );
 
+  const lowest =
+    Math.min(
+      ...recent.map(c => c.low)
+    );
 
-  const recent =
-    candles.slice(-10);
+  supply = {
+    high: highest,
+    low: highest -
+      getAverageRange(recent)
+  };
 
-
-  let demand = null;
-  let supply = null;
-
-
-  for (
-    let i = recent.length - 2;
-    i >= 0;
-    i--
-  ) {
-    const base =
-      recent[i];
-
-
-    const move =
-      recent
-        .slice(i + 1)
-        .reduce(
-          (sum, c) =>
-            sum +
-            Math.abs(
-              c.close -
-              c.open
-            ),
-          0
-        );
-
-
-    if (
-      !demand &&
-      move >
-        avgRange * 1.5 &&
-      base.close <
-        base.open
-    ) {
-      demand = {
-        low: base.low,
-        high: base.high,
-        index: i
-      };
-    }
-
-
-    if (
-      !supply &&
-      move >
-        avgRange * 1.5 &&
-      base.close >
-        base.open
-    ) {
-      supply = {
-        low: base.low,
-        high: base.high,
-        index: i
-      };
-    }
-  }
-
+  demand = {
+    low: lowest,
+    high: lowest +
+      getAverageRange(recent)
+  };
 
   return {
-    demand,
-    supply
+    supply,
+    demand
   };
 }
 
@@ -1762,90 +1496,53 @@ function detectSupplyDemand(
    ORDER BLOCK
    ============================================================ */
 
-function detectOrderBlock(
-  candles,
-  displacement
-) {
-  if (
-    candles.length < 5
-  ) {
-    return null;
+function detectOrderBlock(candles) {
+  if (candles.length < 6) {
+    return {
+      bullish: null,
+      bearish: null
+    };
   }
 
+  const averageRange =
+    getAverageRange(candles);
 
-  const last =
-    candles[
-      candles.length - 1
-    ];
+  const last = candles.at(-1);
+  const previous = candles.at(-2);
 
+  const bullishDisplacement =
+    last.close > previous.high &&
+    last.close - last.open >
+      averageRange * 0.6;
 
-  const range =
-    last.high - last.low;
+  const bearishDisplacement =
+    last.close < previous.low &&
+    last.open - last.close >
+      averageRange * 0.6;
 
+  let bullish = null;
+  let bearish = null;
 
-  if (
-    !displacement
-  ) {
-    return null;
+  if (bullishDisplacement) {
+    bullish = {
+      high: previous.high,
+      low: previous.low,
+      index: candles.length - 2
+    };
   }
 
-
-  /*
-   * Search backward for the opposite candle
-   * before displacement.
-   */
-  for (
-    let i =
-      candles.length - 2;
-    i >=
-      Math.max(
-        0,
-        candles.length - 8
-      );
-    i--
-  ) {
-    const candle =
-      candles[i];
-
-
-    if (
-      displacement.direction ===
-      "BULLISH" &&
-      candle.close <
-        candle.open
-    ) {
-      return {
-        direction: "BULLISH",
-        high: candle.high,
-        low: candle.low,
-        midpoint:
-          (candle.high +
-            candle.low) /
-          2
-      };
-    }
-
-
-    if (
-      displacement.direction ===
-      "BEARISH" &&
-      candle.close >
-        candle.open
-    ) {
-      return {
-        direction: "BEARISH",
-        high: candle.high,
-        low: candle.low,
-        midpoint:
-          (candle.high +
-            candle.low) /
-          2
-      };
-    }
+  if (bearishDisplacement) {
+    bearish = {
+      high: previous.high,
+      low: previous.low,
+      index: candles.length - 2
+    };
   }
 
-
-  return null;
+  return {
+    bullish,
+    bearish
+  };
 }
 
 
@@ -1853,137 +1550,43 @@ function detectOrderBlock(
    FAIR VALUE GAP
    ============================================================ */
 
-function detectFVG(
-  candles
-) {
-  if (
-    candles.length < 3
-  ) {
-    return null;
+function detectFVG(candles) {
+  if (candles.length < 3) {
+    return {
+      bullish: null,
+      bearish: null
+    };
   }
 
+  const a = candles.at(-3);
+  const b = candles.at(-2);
+  const c = candles.at(-1);
 
-  const a =
-    candles[
-      candles.length - 3
-    ];
+  let bullish = null;
+  let bearish = null;
 
-  const b =
-    candles[
-      candles.length - 2
-    ];
-
-  const c =
-    candles[
-      candles.length - 1
-    ];
-
-
-  /*
-   * Bullish FVG
-   */
-  if (
-    c.low > a.high &&
-    b.close > b.open
-  ) {
-    return {
-      direction: "BULLISH",
-      low: a.high,
+  if (c.low > a.high) {
+    bullish = {
       high: c.low,
+      low: a.high,
       midpoint:
-        (a.high + c.low) /
-        2
+        (c.low + a.high) / 2
     };
   }
 
-
-  /*
-   * Bearish FVG
-   */
-  if (
-    c.high < a.low &&
-    b.close < b.open
-  ) {
-    return {
-      direction: "BEARISH",
-      low: c.high,
+  if (c.high < a.low) {
+    bearish = {
       high: a.low,
+      low: c.high,
       midpoint:
-        (c.high + a.low) /
-        2
+        (a.low + c.high) / 2
     };
   }
 
-
-  return null;
-}
-
-
-/* ============================================================
-   DISPLACEMENT
-   ============================================================ */
-
-function detectDisplacement(
-  candles
-) {
-  if (
-    candles.length < 10
-  ) {
-    return null;
-  }
-
-
-  const last =
-    candles[
-      candles.length - 1
-    ];
-
-
-  const avg =
-    getAverageRange(
-      candles.slice(0, -1),
-      20
-    );
-
-
-  const range =
-    last.high -
-    last.low;
-
-
-  if (
-    range <
-    avg * 1.5
-  ) {
-    return null;
-  }
-
-
-  if (
-    last.close >
-    last.open
-  ) {
-    return {
-      direction: "BULLISH",
-      strength:
-        range / avg
-    };
-  }
-
-
-  if (
-    last.close <
-    last.open
-  ) {
-    return {
-      direction: "BEARISH",
-      strength:
-        range / avg
-    };
-  }
-
-
-  return null;
+  return {
+    bullish,
+    bearish
+  };
 }
 
 
@@ -1994,178 +1597,174 @@ function detectDisplacement(
 function detectCandlestickConfirmation(
   candles
 ) {
-  if (
-    candles.length < 2
-  ) {
+  const candle =
+    candles.at(-1);
+
+  if (!candle) {
     return {
       confirmed: false,
+      direction: null,
       pattern: null,
-      direction: null
+      rejection: false,
+      momentum: false
     };
   }
 
+  const range =
+    candle.high - candle.low;
 
-  const c =
-    candles[
-      candles.length - 1
-    ];
-
-  const p =
-    candles[
-      candles.length - 2
-    ];
-
+  if (range <= 0) {
+    return {
+      confirmed: false,
+      direction: null,
+      pattern: null,
+      rejection: false,
+      momentum: false
+    };
+  }
 
   const body =
     Math.abs(
-      c.close - c.open
+      candle.close - candle.open
     );
-
 
   const upperWick =
-    c.high -
+    candle.high -
     Math.max(
-      c.open,
-      c.close
+      candle.open,
+      candle.close
     );
-
 
   const lowerWick =
     Math.min(
-      c.open,
-      c.close
+      candle.open,
+      candle.close
     ) -
-    c.low;
+    candle.low;
+
+  const bullish =
+    candle.close > candle.open;
+
+  const bearish =
+    candle.close < candle.open;
+
+  const bullishPin =
+    lowerWick > body * 1.5 &&
+    lowerWick > upperWick;
+
+  const bearishPin =
+    upperWick > body * 1.5 &&
+    upperWick > lowerWick;
+
+  const strongBull =
+    bullish &&
+    body / range >= 0.65;
+
+  const strongBear =
+    bearish &&
+    body / range >= 0.65;
+
+  let direction = null;
+  let pattern = null;
+
+  if (
+    bullishPin ||
+    strongBull
+  ) {
+    direction = "BUY";
+
+    pattern = bullishPin
+      ? "BULLISH REJECTION"
+      : "BULLISH MOMENTUM";
+  }
+
+  if (
+    bearishPin ||
+    strongBear
+  ) {
+    direction = "SELL";
+
+    pattern = bearishPin
+      ? "BEARISH REJECTION"
+      : "BEARISH MOMENTUM";
+  }
+
+  return {
+    confirmed: Boolean(direction),
+    direction,
+    pattern,
+
+    rejection:
+      bullishPin ||
+      bearishPin,
+
+    momentum:
+      strongBull ||
+      strongBear
+  };
+}
 
 
-  const range =
-    c.high - c.low;
+/* ============================================================
+   DISPLACEMENT
+   ============================================================ */
 
-
-  if (!range) {
+function detectDisplacement(candles) {
+  if (candles.length < 10) {
     return {
-      confirmed: false,
-      pattern: null,
+      detected: false,
       direction: null
     };
   }
 
+  const average =
+    getAverageRange(
+      candles.slice(-10)
+    );
 
-  /*
-   * Bullish rejection
-   */
-  if (
-    lowerWick >
-      body * 1.5 &&
-    c.close >
-      c.open
-  ) {
+  const last =
+    candles.at(-1);
+
+  const range =
+    last.high - last.low;
+
+  if (range < average * 1.4) {
     return {
-      confirmed: true,
-      pattern:
-        "Bullish Rejection",
-      direction: "BULLISH"
+      detected: false,
+      direction: null
     };
   }
-
-
-  /*
-   * Bearish rejection
-   */
-  if (
-    upperWick >
-      body * 1.5 &&
-    c.close <
-      c.open
-  ) {
-    return {
-      confirmed: true,
-      pattern:
-        "Bearish Rejection",
-      direction: "BEARISH"
-    };
-  }
-
-
-  /*
-   * Bullish engulfing
-   */
-  if (
-    p.close < p.open &&
-    c.close > c.open &&
-    c.open <= p.close &&
-    c.close >= p.open
-  ) {
-    return {
-      confirmed: true,
-      pattern:
-        "Bullish Engulfing",
-      direction: "BULLISH"
-    };
-  }
-
-
-  /*
-   * Bearish engulfing
-   */
-  if (
-    p.close > p.open &&
-    c.close < c.open &&
-    c.open >= p.close &&
-    c.close <= p.open
-  ) {
-    return {
-      confirmed: true,
-      pattern:
-        "Bearish Engulfing",
-      direction: "BEARISH"
-    };
-  }
-
-
-  /*
-   * Strong bullish close
-   */
-  if (
-    c.close >
-      c.open &&
-    (c.close - c.low) /
-      range >
-      0.75
-  ) {
-    return {
-      confirmed: true,
-      pattern:
-        "Strong Bullish Close",
-      direction: "BULLISH"
-    };
-  }
-
-
-  /*
-   * Strong bearish close
-   */
-  if (
-    c.close <
-      c.open &&
-    (c.high - c.close) /
-      range >
-      0.75
-  ) {
-    return {
-      confirmed: true,
-      pattern:
-        "Strong Bearish Close",
-      direction: "BEARISH"
-    };
-  }
-
 
   return {
-    confirmed: false,
-    pattern: null,
-    direction: null
+    detected: true,
+
+    direction:
+      last.close > last.open
+        ? "BUY"
+        : "SELL"
   };
+}
+
+
+/* ============================================================
+   AVERAGE RANGE
+   ============================================================ */
+
+function getAverageRange(candles) {
+  if (!candles.length) return 0;
+
+  const ranges =
+    candles.map(
+      c => c.high - c.low
+    );
+
+  return (
+    ranges.reduce(
+      (sum, value) =>
+        sum + value,
+      0
+    ) / ranges.length
+  );
 }
 
 
@@ -2183,117 +1782,65 @@ function analyzeTimeframe(
       timeframe
     );
 
-
-  if (
-    candles.length < 30
-  ) {
+  if (candles.length < 20) {
     return {
       symbol,
       timeframe,
+      candles,
       ready: false,
       reason:
-        `Not enough ${timeframe} closed candles.`,
-      candles
+        `Not enough closed ${timeframe} candles.`
     };
   }
 
-
-  const swings =
-    detectSwings(candles);
-
-
   const structure =
-    classifyStructure(
-      swings
-    );
-
+    classifyStructure(candles);
 
   const events =
-    detectStructureEvents(
-      candles,
-      structure
-    );
-
+    detectStructureEvents(candles);
 
   const liquidity =
-    detectLiquidity(
-      candles,
-      structure
-    );
-
+    detectLiquidity(candles);
 
   const sr =
-    detectSupportResistance(
-      candles,
-      swings
-    );
+    detectSupportResistance(candles);
 
+  const supplyDemand =
+    detectSupplyDemand(candles);
 
-  const displacement =
-    detectDisplacement(
-      candles
-    );
-
+  const orderBlock =
+    detectOrderBlock(candles);
 
   const fvg =
     detectFVG(candles);
-
-
-  const orderBlock =
-    detectOrderBlock(
-      candles,
-      displacement
-    );
-
-
-  const supplyDemand =
-    detectSupplyDemand(
-      candles
-    );
-
 
   const candle =
     detectCandlestickConfirmation(
       candles
     );
 
-
-  const last =
-    candles[
-      candles.length - 1
-    ];
-
+  const displacement =
+    detectDisplacement(candles);
 
   return {
     symbol,
-
     timeframe,
+    candles,
 
     ready: true,
 
-    candles,
-
-    currentPrice: last.close,
-
-    swings,
+    price:
+      candles.at(-1)?.close ?? null,
 
     structure,
-
     events,
-
     liquidity,
-
-    supportResistance: sr,
-
-    displacement,
-
-    fvg,
-
-    orderBlock,
-
+    sr,
     supplyDemand,
-
-    candleConfirmation: candle
+    orderBlock,
+    fvg,
+    candle,
+    displacement
   };
 }
 
@@ -2302,119 +1849,135 @@ function analyzeTimeframe(
    TOP-DOWN ANALYSIS
    ============================================================ */
 
-function buildTopDownAnalysis(
+async function buildTopDownAnalysis(
   symbol,
   selectedTimeframe
 ) {
-  selectedTimeframe =
-    selectedTimeframe ||
-    getSelectedTimeframe();
-
-
   /*
-   * IMPORTANT:
-   * Selected TF is explicitly marked PRIMARY.
-   */
+    Selected timeframe is ALWAYS loaded and used
+    as the execution timeframe.
+  */
 
-  const timeframes =
-    Array.from(
-      new Set([
-        ...CONFIG.TOP_DOWN,
-        selectedTimeframe
-      ])
+  const execution =
+    analyzeTimeframe(
+      symbol,
+      selectedTimeframe
     );
 
+  /*
+    Higher timeframe context.
 
-  const result = {};
+    These are separate datasets.
 
+    They do NOT replace the selected timeframe.
+  */
 
-  timeframes.forEach(tf => {
-    result[tf] =
-      analyzeTimeframe(
-        symbol,
-        tf
-      );
-  });
-
-
-  return {
-    symbol,
-
-    selectedTimeframe,
-
-    primary:
-      result[selectedTimeframe],
-
-    timeframes: result,
-
-    htfBias:
-      getHTFBias(result)
-  };
-}
-
-
-/* ============================================================
-   HTF BIAS
-   ============================================================ */
-
-function getHTFBias(
-  analyses
-) {
-  const priority = [
+  const contextTimeframes = [
     "Daily",
     "H4",
     "H2",
     "H1"
   ];
 
+  const context = {};
+
+  for (const tf of contextTimeframes) {
+    if (tf === selectedTimeframe) {
+      context[tf] = execution;
+      continue;
+    }
+
+    const existing =
+      state.candles[symbol]?.[tf];
+
+    if (
+      !existing?.candles?.length
+    ) {
+      try {
+        await loadTimeframeHistory(
+          symbol,
+          tf,
+          false
+        );
+      } catch (error) {
+        console.warn(
+          `Unable to load ${tf}:`,
+          error
+        );
+      }
+    }
+
+    context[tf] =
+      analyzeTimeframe(
+        symbol,
+        tf
+      );
+  }
+
+  const h1 =
+    context.H1;
+
+  const htfBias =
+    getHTFBias(context);
+
+  return {
+    symbol,
+
+    selectedTimeframe,
+
+    execution,
+
+    context,
+
+    h1,
+
+    htfBias
+  };
+}
+
+
+/* ============================================================
+   HIGHER TIMEFRAME BIAS
+   ============================================================ */
+
+function getHTFBias(context) {
+  const weights = {
+    Daily: 4,
+    H4: 3,
+    H2: 2,
+    H1: 1
+  };
 
   let bullish = 0;
   let bearish = 0;
 
+  Object.keys(weights).forEach(tf => {
+    const item = context[tf];
 
-  priority.forEach(tf => {
-    const analysis =
-      analyses[tf];
-
-
-    if (
-      !analysis ||
-      !analysis.ready
-    ) {
-      return;
-    }
-
+    if (!item?.ready) return;
 
     if (
-      analysis.structure.bias ===
+      item.structure?.bias ===
       "BULLISH"
     ) {
-      bullish++;
+      bullish += weights[tf];
     }
 
-
     if (
-      analysis.structure.bias ===
+      item.structure?.bias ===
       "BEARISH"
     ) {
-      bearish++;
+      bearish += weights[tf];
     }
   });
 
-
-  if (
-    bullish > bearish
-  ) {
+  if (bullish > bearish) {
     return "BULLISH";
   }
 
-
-  if (
-    bearish > bullish
-  ) {
+  if (bearish > bullish) {
     return "BEARISH";
   }
-
 
   return "NEUTRAL";
 }
@@ -2425,269 +1988,278 @@ function getHTFBias(
    ============================================================ */
 
 function determineDirection(
-  primary,
-  htfBias
+  execution,
+  topDown
 ) {
-  if (!primary) {
-    return null;
-  }
-
-
-  const votes = {
-    BULLISH: 0,
-    BEARISH: 0
+  const scores = {
+    BUY: 0,
+    SELL: 0
   };
 
-
   if (
-    primary.structure.bias ===
+    execution.structure.bias ===
     "BULLISH"
   ) {
-    votes.BULLISH++;
+    scores.BUY += 2;
   }
 
-
   if (
-    primary.structure.bias ===
+    execution.structure.bias ===
     "BEARISH"
   ) {
-    votes.BEARISH++;
+    scores.SELL += 2;
   }
 
-
   if (
-    primary.events.direction ===
+    execution.events.bos ===
     "BULLISH"
   ) {
-    votes.BULLISH += 2;
+    scores.BUY += 3;
   }
 
-
   if (
-    primary.events.direction ===
+    execution.events.bos ===
     "BEARISH"
   ) {
-    votes.BEARISH += 2;
+    scores.SELL += 3;
   }
 
-
   if (
-    primary.liquidity.direction ===
+    execution.events.choch ===
     "BULLISH"
   ) {
-    votes.BULLISH += 2;
+    scores.BUY += 2;
   }
 
-
   if (
-    primary.liquidity.direction ===
+    execution.events.choch ===
     "BEARISH"
   ) {
-    votes.BEARISH += 2;
+    scores.SELL += 2;
   }
-
 
   if (
-    primary.displacement?.direction ===
-    "BULLISH"
+    execution.liquidity.direction ===
+    "BUY"
   ) {
-    votes.BULLISH++;
+    scores.BUY += 2;
   }
-
 
   if (
-    primary.displacement?.direction ===
-    "BEARISH"
+    execution.liquidity.direction ===
+    "SELL"
   ) {
-    votes.BEARISH++;
+    scores.SELL += 2;
   }
-
 
   if (
-    primary.candleConfirmation?.direction ===
-    "BULLISH"
+    execution.displacement.direction ===
+    "BUY"
   ) {
-    votes.BULLISH++;
+    scores.BUY += 2;
   }
-
 
   if (
-    primary.candleConfirmation?.direction ===
-    "BEARISH"
+    execution.displacement.direction ===
+    "SELL"
   ) {
-    votes.BEARISH++;
+    scores.SELL += 2;
   }
 
+  if (
+    execution.candle.direction ===
+    "BUY"
+  ) {
+    scores.BUY += 2;
+  }
+
+  if (
+    execution.candle.direction ===
+    "SELL"
+  ) {
+    scores.SELL += 2;
+  }
 
   /*
-   * HTF context is supportive, not an automatic trigger.
-   */
-  if (htfBias === "BULLISH") {
-    votes.BULLISH++;
+    HTF context is confirmation,
+    not a replacement for execution timeframe.
+  */
+
+  if (topDown.htfBias === "BULLISH") {
+    scores.BUY += 2;
   }
 
-
-  if (htfBias === "BEARISH") {
-    votes.BEARISH++;
+  if (topDown.htfBias === "BEARISH") {
+    scores.SELL += 2;
   }
-
 
   if (
-    votes.BULLISH ===
-    votes.BEARISH
+    scores.BUY === 0 &&
+    scores.SELL === 0
   ) {
     return null;
   }
 
+  if (scores.BUY > scores.SELL) {
+    return "BUY";
+  }
 
-  return votes.BULLISH >
-    votes.BEARISH
-    ? "BULLISH"
-    : "BEARISH";
+  if (scores.SELL > scores.BUY) {
+    return "SELL";
+  }
+
+  return null;
 }
 
 
 /* ============================================================
-   EVIDENCE SCORE
+   EVIDENCE SCORING
    ============================================================ */
 
 function scoreEvidence(
-  primary,
-  direction
+  direction,
+  execution,
+  topDown
 ) {
-  if (!primary || !direction) {
-    return {
-      score: 0,
-      confirmations: 0,
-      reasons: []
-    };
-  }
-
-
   let score = 0;
-
-  let confirmations = 0;
-
-  const reasons = [];
-
+  const evidence = [];
 
   if (
-    primary.structure.bias ===
-    direction
+    direction === "BUY" &&
+    execution.structure.bias ===
+      "BULLISH"
   ) {
     score += 2;
-    confirmations++;
-
-    reasons.push(
-      `${direction} market structure`
+    evidence.push(
+      `${execution.timeframe} bullish structure`
     );
   }
 
-
   if (
-    primary.events.direction ===
-    direction
+    direction === "SELL" &&
+    execution.structure.bias ===
+      "BEARISH"
   ) {
     score += 2;
-    confirmations++;
-
-    reasons.push(
-      primary.events.choch
-        ? "CHoCH confirmation"
-        : "BOS confirmation"
+    evidence.push(
+      `${execution.timeframe} bearish structure`
     );
   }
 
-
   if (
-    primary.liquidity.direction ===
-    direction &&
-    primary.liquidity.swept
+    execution.events.bos ===
+    direction
   ) {
-    score += 2;
-    confirmations++;
-
-    reasons.push(
-      primary.liquidity.type
+    score += 3;
+    evidence.push(
+      `${execution.timeframe} BOS ${direction}`
     );
   }
 
-
   if (
-    primary.displacement?.direction ===
+    execution.events.choch ===
     direction
   ) {
     score += 2;
-    confirmations++;
-
-    reasons.push(
-      "Displacement"
+    evidence.push(
+      `${execution.timeframe} CHoCH ${direction}`
     );
   }
 
+  if (
+    execution.liquidity.direction ===
+    direction
+  ) {
+    score += 2;
+    evidence.push(
+      `${execution.timeframe} liquidity sweep`
+    );
+  }
 
   if (
-    primary.fvg?.direction ===
+    execution.displacement.direction ===
     direction
+  ) {
+    score += 2;
+    evidence.push(
+      `${execution.timeframe} displacement`
+    );
+  }
+
+  if (
+    execution.candle.direction ===
+    direction
+  ) {
+    score += 2;
+    evidence.push(
+      execution.candle.pattern ||
+      "Candlestick confirmation"
+    );
+  }
+
+  if (
+    direction === "BUY" &&
+    topDown.htfBias === "BULLISH"
+  ) {
+    score += 2;
+    evidence.push(
+      "HTF bullish alignment"
+    );
+  }
+
+  if (
+    direction === "SELL" &&
+    topDown.htfBias === "BEARISH"
+  ) {
+    score += 2;
+    evidence.push(
+      "HTF bearish alignment"
+    );
+  }
+
+  if (
+    execution.fvg?.bullish &&
+    direction === "BUY"
   ) {
     score += 1;
-    confirmations++;
-
-    reasons.push(
-      "FVG"
+    evidence.push(
+      "Bullish FVG"
     );
   }
-
 
   if (
-    primary.orderBlock?.direction ===
-    direction
+    execution.fvg?.bearish &&
+    direction === "SELL"
   ) {
     score += 1;
-    confirmations++;
-
-    reasons.push(
-      "Order Block"
+    evidence.push(
+      "Bearish FVG"
     );
   }
-
 
   if (
-    primary.candleConfirmation?.direction ===
-    direction &&
-    primary.candleConfirmation.confirmed
+    execution.orderBlock?.bullish &&
+    direction === "BUY"
   ) {
-    score += 2;
-    confirmations++;
-
-    reasons.push(
-      primary.candleConfirmation.pattern
-    );
-  }
-
-
-  const zone =
-    direction === "BULLISH"
-      ? primary.supplyDemand?.demand
-      : primary.supplyDemand?.supply;
-
-
-  if (zone) {
     score += 1;
-    confirmations++;
-
-    reasons.push(
-      direction === "BULLISH"
-        ? "Demand zone"
-        : "Supply zone"
+    evidence.push(
+      "Bullish order block"
     );
   }
 
+  if (
+    execution.orderBlock?.bearish &&
+    direction === "SELL"
+  ) {
+    score += 1;
+    evidence.push(
+      "Bearish order block"
+    );
+  }
 
   return {
     score,
-    confirmations,
-    reasons
+    evidence
   };
 }
 
@@ -2697,124 +2269,88 @@ function scoreEvidence(
    ============================================================ */
 
 function gradeSetup(
-  primary,
   direction,
+  execution,
   evidence
 ) {
-  if (
-    !primary ||
-    !direction ||
-    !evidence
-  ) {
-    return {
-      grade: "NO SETUP",
-      rank: 0
-    };
-  }
-
-
-  const {
-    score,
-    confirmations
-  } = evidence;
-
+  const score =
+    evidence.score;
 
   const candleConfirmed =
-    primary.candleConfirmation
-      ?.confirmed &&
-    primary.candleConfirmation
-      ?.direction === direction;
+    execution.candle.direction ===
+    direction;
 
-
-  /*
-   * A+
-   */
-  if (
-    score >= 11 &&
-    confirmations >= 6 &&
-    candleConfirmed
-  ) {
-    return {
-      grade: "A+",
-      rank: 5
-    };
-  }
-
-
-  /*
-   * A
-   */
-  if (
-    score >= 8 &&
-    confirmations >= 5
-  ) {
-    return {
-      grade: "A",
-      rank: 4
-    };
-  }
-
-
-  /*
-   * B
-   */
-  if (
-    score >= 6 &&
-    confirmations >= 4
-  ) {
-    return {
-      grade: "B",
-      rank: 3
-    };
-  }
-
-
-  /*
-   * C
-   */
-  if (
-    score >= 4 &&
-    confirmations >= 3
-  ) {
-    return {
-      grade: "C",
-      rank: 2
-    };
-  }
-
-
-  /*
-   * EARLY SETUP
-   *
-   * Candlestick confirmation is NOT mandatory here.
-   */
-  const structuralTrigger =
-    primary.events.direction ===
+  const structuralConfirmation =
+    execution.events.bos ===
       direction ||
-    (
-      primary.liquidity.swept &&
-      primary.liquidity.direction ===
-        direction
-    ) ||
-    primary.displacement?.direction ===
+    execution.events.choch ===
+      direction ||
+    execution.liquidity.direction ===
+      direction ||
+    execution.displacement.direction ===
       direction;
 
+  /*
+    EARLY SETUP
+
+    Does NOT require every confirmation.
+
+    This is intentional.
+  */
+
+  if (
+    score >= 4 &&
+    structuralConfirmation
+  ) {
+    if (
+      score >= 13 &&
+      candleConfirmed &&
+      execution.events.bos ===
+        direction
+    ) {
+      return "A+";
+    }
+
+    if (
+      score >= 10 &&
+      candleConfirmed
+    ) {
+      return "A";
+    }
+
+    if (score >= 7) {
+      return "B";
+    }
+
+    if (score >= 4) {
+      return "C";
+    }
+  }
+
+  /*
+    EARLY monitoring signal.
+
+    Allows the bot to alert before
+    every confirmation is present.
+  */
 
   if (
     score >= 3 &&
-    structuralTrigger
+    (
+      execution.structure.bias ===
+        (direction === "BUY"
+          ? "BULLISH"
+          : "BEARISH") ||
+      execution.liquidity.direction ===
+        direction ||
+      execution.displacement.direction ===
+        direction
+    )
   ) {
-    return {
-      grade: "EARLY SETUP",
-      rank: 1
-    };
+    return "EARLY SETUP";
   }
 
-
-  return {
-    grade: "NO SETUP",
-    rank: 0
-  };
+  return "NO SETUP";
 }
 
 
@@ -2823,179 +2359,97 @@ function gradeSetup(
    ============================================================ */
 
 function calculateTradeLevels(
-  primary,
-  direction
+  direction,
+  execution
 ) {
+  const candles =
+    execution.candles;
+
+  const last =
+    candles.at(-1);
+
+  if (!last) return null;
+
+  const entry =
+    last.close;
+
+  const range =
+    getAverageRange(
+      candles.slice(-20)
+    );
+
   if (
-    !primary ||
-    !primary.candles?.length ||
-    !direction
+    !Number.isFinite(entry) ||
+    !Number.isFinite(range) ||
+    range <= 0
   ) {
     return null;
   }
 
-
-  const candles =
-    primary.candles;
-
-
-  const current =
-    candles[
-      candles.length - 1
-    ].close;
-
-
-  const avgRange =
-    getAverageRange(
-      candles,
-      20
-    );
-
-
-  let entry =
-    current;
-
+  const structure =
+    execution.structure;
 
   let sl;
 
-
-  if (
-    direction ===
-    "BULLISH"
-  ) {
-    const swingLow =
-      primary.structure
-        .latestLow?.price;
-
-
-    const demandLow =
-      primary.supplyDemand
-        ?.demand?.low;
-
-
-    const candidates =
-      [
-        swingLow,
-        demandLow
-      ].filter(
-        Number.isFinite
-      );
-
-
-    const base =
-      candidates.length
-        ? Math.min(
-            ...candidates
-          )
-        : current -
-          avgRange;
-
+  if (direction === "BUY") {
+    const structuralLow =
+      structure.latestLow?.price;
 
     sl =
-      base -
-      avgRange * 0.15;
-
-
-    if (
-      sl >= entry
-    ) {
-      sl =
-        entry -
-        avgRange;
-    }
+      structuralLow &&
+      structuralLow < entry
+        ? structuralLow -
+          range * 0.15
+        : entry -
+          range * 1.2;
   } else {
-    const swingHigh =
-      primary.structure
-        .latestHigh?.price;
-
-
-    const supplyHigh =
-      primary.supplyDemand
-        ?.supply?.high;
-
-
-    const candidates =
-      [
-        swingHigh,
-        supplyHigh
-      ].filter(
-        Number.isFinite
-      );
-
-
-    const base =
-      candidates.length
-        ? Math.max(
-            ...candidates
-          )
-        : current +
-          avgRange;
-
+    const structuralHigh =
+      structure.latestHigh?.price;
 
     sl =
-      base +
-      avgRange * 0.15;
-
-
-    if (
-      sl <= entry
-    ) {
-      sl =
-        entry +
-        avgRange;
-    }
+      structuralHigh &&
+      structuralHigh > entry
+        ? structuralHigh +
+          range * 0.15
+        : entry +
+          range * 1.2;
   }
-
 
   const risk =
-    Math.abs(
-      entry - sl
-    );
+    Math.abs(entry - sl);
 
-
-  if (
-    !risk ||
-    !Number.isFinite(risk)
-  ) {
-    return null;
-  }
-
+  if (!risk) return null;
 
   const tp1 =
-    direction ===
-    "BULLISH"
+    direction === "BUY"
       ? entry + risk * 2
       : entry - risk * 2;
 
-
   const tp2 =
-    direction ===
-    "BULLISH"
+    direction === "BUY"
       ? entry + risk * 3
       : entry - risk * 3;
 
-
-  const be = entry;
-
+  const be =
+    entry;
 
   return {
-    entry: round(entry),
-    sl: round(sl),
-    be: round(be),
-    tp1: round(tp1),
-    tp2: round(tp2),
+    entry,
+    sl,
+    be,
+    tp1,
+    tp2,
+
+    risk,
 
     rrTP1: 2,
-
-    rrTP2: 3,
-
-    risk: round(risk)
+    rrTP2: 3
   };
 }
 
 
 /* ============================================================
-   PRECISION SIGNAL
+   SIGNAL GENERATION
    ============================================================ */
 
 function generatePrecisionSignal(
@@ -3003,148 +2457,171 @@ function generatePrecisionSignal(
   timeframe,
   topDown
 ) {
-  const primary =
-    topDown.primary;
+  /*
+    CRITICAL:
 
+    Signal is generated from topDown.execution,
+    which is the EXACT selected timeframe.
+
+    There is no M5 fallback here.
+  */
+
+  const execution =
+    topDown.execution;
 
   if (
-    !primary ||
-    !primary.ready
+    !execution ||
+    !execution.ready
   ) {
     return {
-      signal: "WAIT",
-      grade: "NO SETUP",
-      timeframe,
+      status: "WAIT",
+      signal: null,
       reason:
-        `Waiting for ${timeframe} closed-candle data.`
+        `Waiting for ${timeframe} closed candles.`
     };
   }
-
 
   const direction =
     determineDirection(
-      primary,
-      topDown.htfBias
+      execution,
+      topDown
     );
-
 
   if (!direction) {
     return {
-      signal: "WAIT",
-      grade: "NO SETUP",
-      timeframe,
+      status: "NO SETUP",
+      signal: null,
       reason:
-        `No clear ${timeframe} directional structure.`
+        `No confirmed ${timeframe} directional setup.`
     };
   }
-
 
   const evidence =
     scoreEvidence(
-      primary,
-      direction
+      direction,
+      execution,
+      topDown
     );
-
 
   const grade =
     gradeSetup(
-      primary,
       direction,
+      execution,
       evidence
     );
 
-
-  if (
-    grade.rank === 0
-  ) {
+  if (grade === "NO SETUP") {
     return {
-      signal: "WAIT",
-      grade: "NO SETUP",
-      timeframe,
-
-      direction,
-
-      score:
-        evidence.score,
-
-      confirmations:
-        evidence.confirmations,
-
-      reasons:
-        evidence.reasons,
-
+      status: "NO SETUP",
+      signal: null,
       reason:
-        `No confirmed ${timeframe} setup.`
+        `No valid ${timeframe} setup.`
     };
   }
 
-
   const levels =
     calculateTradeLevels(
-      primary,
-      direction
+      direction,
+      execution
     );
 
+  if (!levels) {
+    return {
+      status: "WAIT",
+      signal: null,
+      reason:
+        `Waiting for valid ${timeframe} trade levels.`
+    };
+  }
 
-  return {
-    signal:
-      direction ===
-      "BULLISH"
-        ? "BUY"
-        : "SELL",
+  const signal = {
+    id:
+      `${symbol}_${timeframe}_${direction}`,
 
-    direction,
-
-    grade:
-      grade.grade,
-
-    rank:
-      grade.rank,
+    symbol,
 
     timeframe,
 
-    symbol,
+    direction,
+
+    grade,
 
     score:
       evidence.score,
 
-    confirmations:
-      evidence.confirmations,
+    confidence:
+      clamp(
+        50 +
+          evidence.score * 3,
+        50,
+        97
+      ),
 
-    reasons:
-      evidence.reasons,
+    entry:
+      levels.entry,
 
-    levels,
+    sl:
+      levels.sl,
+
+    be:
+      levels.be,
+
+    tp1:
+      levels.tp1,
+
+    tp2:
+      levels.tp2,
+
+    rr:
+      levels.rrTP2,
 
     htfBias:
       topDown.htfBias,
 
     structure:
-      primary.structure,
+      execution.structure.bias,
+
+    bos:
+      execution.events.bos,
+
+    choch:
+      execution.events.choch,
 
     liquidity:
-      primary.liquidity,
+      execution.liquidity,
 
-    events:
-      primary.events,
+    candle:
+      execution.candle,
 
     fvg:
-      primary.fvg,
+      execution.fvg,
 
     orderBlock:
-      primary.orderBlock,
+      execution.orderBlock,
 
-    supplyDemand:
-      primary.supplyDemand,
+    evidence:
+      evidence.evidence,
 
-    candleConfirmation:
-      primary.candleConfirmation,
+    explanation:
+      buildAIExplanation(
+        direction,
+        timeframe,
+        grade,
+        execution,
+        topDown,
+        evidence,
+        levels
+      ),
 
-    supportResistance:
-      primary.supportResistance,
+    createdAt: now(),
 
-    currentPrice:
-      primary.currentPrice
+    invalidated: false
+  };
+
+  return {
+    status: "SIGNAL",
+    signal,
+    reason: ""
   };
 }
 
@@ -3154,105 +2631,101 @@ function generatePrecisionSignal(
    ============================================================ */
 
 function buildAIExplanation(
-  signal
+  direction,
+  timeframe,
+  grade,
+  execution,
+  topDown,
+  evidence,
+  levels
 ) {
-  if (!signal) {
-    return "No analysis available.";
-  }
+  const parts = [];
 
+  parts.push(
+    `${direction} setup detected on ${timeframe}.`
+  );
+
+  parts.push(
+    `Setup grade: ${grade}.`
+  );
+
+  parts.push(
+    `HTF bias: ${topDown.htfBias}.`
+  );
 
   if (
-    signal.signal ===
-    "WAIT"
+    execution.structure?.bias
   ) {
-    return (
-      `WAIT on ${signal.timeframe}. ` +
-      `${signal.reason || "No confirmed setup."} ` +
-      `The engine will continue monitoring live closed-candle data.`
+    parts.push(
+      `${timeframe} structure is ${execution.structure.bias}.`
     );
   }
 
-
-  const directionText =
-    signal.signal === "BUY"
-      ? "bullish"
-      : "bearish";
-
-
-  let explanation =
-    `${signal.signal} ${signal.grade} setup on ${signal.timeframe}. `;
-
-
-  explanation +=
-    `The primary ${signal.timeframe} structure is being used as the signal timeframe. `;
-
-
   if (
-    signal.htfBias &&
-    signal.htfBias !==
-      "NEUTRAL"
+    execution.events.bos
   ) {
-    explanation +=
-      `Higher-timeframe context is ${signal.htfBias}. `;
+    parts.push(
+      `${timeframe} ${execution.events.bos} BOS detected.`
+    );
   }
 
-
   if (
-    signal.events?.bos
+    execution.events.choch
   ) {
-    explanation +=
-      `${signal.events.bos.type} supports the ${directionText} direction. `;
+    parts.push(
+      `${timeframe} ${execution.events.choch} CHoCH detected.`
+    );
   }
 
-
   if (
-    signal.liquidity?.swept
+    execution.liquidity?.sweep
   ) {
-    explanation +=
-      `${signal.liquidity.type} has been detected. `;
+    parts.push(
+      `${execution.liquidity.type} detected.`
+    );
   }
 
-
   if (
-    signal.fvg
+    execution.displacement?.detected
   ) {
-    explanation +=
-      `A ${signal.fvg.direction} FVG is present. `;
+    parts.push(
+      `${timeframe} displacement confirmed.`
+    );
   }
 
-
   if (
-    signal.orderBlock
+    execution.candle?.confirmed
   ) {
-    explanation +=
-      `A ${signal.orderBlock.direction} order block is present. `;
-  }
-
-
-  if (
-    signal.candleConfirmation
-      ?.confirmed
-  ) {
-    explanation +=
-      `${signal.candleConfirmation.pattern} confirms price action. `;
+    parts.push(
+      `${execution.candle.pattern} candle confirmation.`
+    );
   } else {
-    explanation +=
-      `Candlestick confirmation is not yet complete. `;
+    parts.push(
+      `Candlestick confirmation is not yet complete.`
+    );
   }
 
+  parts.push(
+    `Entry: ${formatPrice(levels.entry)}.`
+  );
 
-  if (
-    signal.levels
-  ) {
-    explanation +=
-      `Entry ${signal.levels.entry}, ` +
-      `SL ${signal.levels.sl}, ` +
-      `TP1 ${signal.levels.tp1}, ` +
-      `TP2 ${signal.levels.tp2}.`;
-  }
+  parts.push(
+    `SL: ${formatPrice(levels.sl)}.`
+  );
 
+  parts.push(
+    `TP1: ${formatPrice(levels.tp1)}.`
+  );
 
-  return explanation;
+  parts.push(
+    `TP2: ${formatPrice(levels.tp2)}.`
+  );
+
+  parts.push(
+    `Risk-to-TP2 is approximately 1:${levels.rrTP2}.`
+  );
+
+  return parts.join(" ");
 }
 
 
@@ -3261,134 +2734,116 @@ function buildAIExplanation(
    ============================================================ */
 
 async function runPrecisionAnalysis(
-  manual = false
+  force = false
 ) {
-  if (
-    state.analysisRunning
-  ) {
-    return state.analysis;
+  if (state.analysisRunning) {
+    return;
   }
-
 
   const symbol =
     state.selectedSymbol ||
     $("#market")?.value;
 
-
   const timeframe =
     getSelectedTimeframe();
 
-
   if (!symbol) {
-    setAnalysisStatus(
-      "Select a market."
+    setWaitingState(
+      "NO MARKET",
+      "Select a market first."
     );
-
-    return null;
+    return;
   }
 
+  state.selectedSymbol = symbol;
 
-  /*
-   * CRITICAL:
-   * Re-bind the state to the current UI selection
-   * immediately before analysis.
-   */
-  state.selectedTimeframe =
-    timeframe;
-
-  state.requestedTimeframe =
-    timeframe;
-
+  updateChosenPairDisplay();
+  updateMarketName();
 
   state.analysisRunning = true;
 
-
   try {
-    setAnalysisStatus(
-      manual
-        ? `Analyzing ${symbol} on ${timeframe}...`
-        : `Monitoring ${symbol} on ${timeframe}...`
-    );
+    /*
+      STEP 1:
+      Get EXACT selected timeframe data.
+    */
 
+    let candles =
+      await ensureTimeframeData(
+        symbol,
+        timeframe,
+        force
+      );
 
     /*
-     * Make absolutely sure the selected TF exists.
-     */
-    await ensureTimeframeData(
-      symbol,
-      timeframe,
-      manual
-    );
+      If data is too short, request again.
+    */
 
-
-    /*
-     * Load context timeframes too.
-     */
-    await loadRequiredTimeframes(
-      symbol,
-      timeframe
-    );
-
+    if (candles.length < 20) {
+      candles =
+        await ensureTimeframeData(
+          symbol,
+          timeframe,
+          true
+        );
+    }
 
     /*
-     * Build analysis AFTER the requested TF data
-     * has been stored under the correct timeframe.
-     */
+      STEP 2:
+      Build top-down context.
+    */
+
     const topDown =
-      buildTopDownAnalysis(
+      await buildTopDownAnalysis(
         symbol,
         timeframe
       );
 
+    /*
+      STEP 3:
+      Generate signal using selected timeframe.
+    */
 
-    const signal =
+    const result =
       generatePrecisionSignal(
         symbol,
         timeframe,
         topDown
       );
 
-
-    signal.explanation =
-      buildAIExplanation(
-        signal
-      );
-
-
     const analysis = {
       symbol,
 
       timeframe,
 
-      timestamp:
-        Date.now(),
-
-      currentPrice:
-        state.livePrice ??
-        topDown.primary?.currentPrice,
-
-      primaryTimeframe:
+      selectedTimeframe:
         timeframe,
+
+      price:
+        state.livePrice ??
+        candles.at(-1)?.close ??
+        null,
+
+      candles,
 
       topDown,
 
-      signal,
+      execution:
+        topDown.execution,
 
-      marketInsight:
-        buildMarketInsight(
-          topDown,
-          signal
-        )
+      result,
+
+      generatedAt: now()
     };
-
 
     state.analysis =
       analysis;
 
-
     /*
-     * Expose current state for the Question Bar.
-     */
+      Expose current analysis to the UI
+      and Question Bar.
+    */
+
     window.lastAnalysis =
       analysis;
 
@@ -3400,31 +2855,54 @@ async function runPrecisionAnalysis(
 
     window.currentPrice =
       state.livePrice ??
-      topDown.primary?.currentPrice;
+      candles.at(-1)?.close ??
+      null;
+
+    window.currentTimeframe =
+      timeframe;
 
     window.closedCandles =
-      getClosedCandles(
-        symbol,
-        timeframe
-      );
+      candles;
 
+    /*
+      STEP 4:
+      Update dashboard.
+    */
 
     updateDashboard(
       analysis
     );
 
+    /*
+      STEP 5:
+      Process progressive signal.
+    */
 
-    processSignal(
-      signal,
-      analysis
-    );
+    if (
+      result.status === "SIGNAL" &&
+      result.signal
+    ) {
+      processSignal(
+        result.signal
+      );
+    } else {
+      /*
+        Only show NO SETUP when there really
+        isn't a valid setup.
+      */
 
+      setWaitingState(
+        result.status,
+        result.reason
+      );
+    }
 
     /*
-     * Allow chart code to update without
-     * replacing the chart implementation.
-     */
-    window.dispatchEvent(
+      Allow charts or other UI components
+      to receive the latest analysis.
+    */
+
+    document.dispatchEvent(
       new CustomEvent(
         "precision-analysis",
         {
@@ -3433,132 +2911,20 @@ async function runPrecisionAnalysis(
       )
     );
 
-
-    return analysis;
   } catch (error) {
     console.error(
-      "Precision analysis error:",
+      "Precision analysis failed:",
       error
     );
 
-    setAnalysisStatus(
-      `Analysis error: ${error.message}`
+    setWaitingState(
+      "WAIT",
+      `Waiting for ${symbol} ${timeframe} data.`
     );
 
-    return null;
   } finally {
-    state.analysisRunning =
-      false;
+    state.analysisRunning = false;
   }
-}
-
-
-/* ============================================================
-   MARKET INSIGHTS
-   ============================================================ */
-
-function buildMarketInsight(
-  topDown,
-  signal
-) {
-  const primary =
-    topDown.primary;
-
-
-  if (
-    !primary ||
-    !primary.ready
-  ) {
-    return {
-      bias: "WAIT",
-      structure: "Waiting",
-      liquidity: "Waiting",
-      supportResistance:
-        "Waiting",
-      zones: "Waiting",
-      candle:
-        "Waiting"
-    };
-  }
-
-
-  return {
-    timeframe:
-      topDown.selectedTimeframe,
-
-    bias:
-      primary.structure.bias,
-
-    htfBias:
-      topDown.htfBias,
-
-    structure:
-      formatStructure(
-        primary.structure
-      ),
-
-    bos:
-      primary.events.bos
-        ? primary.events.bos.type
-        : "None",
-
-    choch:
-      primary.events.choch
-        ? primary.events.choch.type
-        : "None",
-
-    liquidity:
-      primary.liquidity.swept
-        ? primary.liquidity.type
-        : "No confirmed sweep",
-
-    support:
-      primary.supportResistance
-        .support,
-
-    resistance:
-      primary.supportResistance
-        .resistance,
-
-    demand:
-      primary.supplyDemand
-        ?.demand || null,
-
-    supply:
-      primary.supplyDemand
-        ?.supply || null,
-
-    fvg:
-      primary.fvg || null,
-
-    orderBlock:
-      primary.orderBlock || null,
-
-    candle:
-      primary.candleConfirmation
-        ?.confirmed
-        ? primary
-            .candleConfirmation
-            .pattern
-        : "No confirmation",
-
-    signal:
-      signal?.signal || "WAIT"
-  };
-}
-
-
-function formatStructure(
-  structure
-) {
-  if (!structure) {
-    return "NEUTRAL";
-  }
-
-  return (
-    structure.bias ||
-    "NEUTRAL"
-  );
 }
 
 
@@ -3566,113 +2932,147 @@ function formatStructure(
    SIGNAL PROCESSING
    ============================================================ */
 
-function processSignal(
-  signal,
-  analysis
-) {
+function processSignal(signal) {
   if (!signal) return;
 
-
   /*
-   * WAIT
-   */
+    Never allow a signal from a different timeframe
+    to overwrite the selected timeframe.
+  */
+
   if (
-    signal.signal ===
-    "WAIT"
+    signal.timeframe !==
+    getSelectedTimeframe()
   ) {
+    console.warn(
+      "Blocked stale timeframe signal:",
+      signal
+    );
+
     return;
   }
-
 
   const key =
-    [
-      analysis.symbol,
-      analysis.timeframe,
-      signal.signal,
-      signal.grade
-    ].join("|");
+    `${signal.symbol}_${signal.timeframe}_${signal.direction}`;
 
+  const previous =
+    state.activeSignal;
+
+  const rank = {
+    "EARLY SETUP": 1,
+    C: 2,
+    B: 3,
+    A: 4,
+    "A+": 5
+  };
 
   /*
-   * Upgrade an existing setup.
-   */
-  if (
-    state.activeSetup &&
-    state.activeSetup.symbol ===
-      analysis.symbol &&
-    state.activeSetup.timeframe ===
-      analysis.timeframe &&
-    state.activeSetup.direction ===
-      signal.direction
-  ) {
-    const previousRank =
-      state.activeSetup.rank ||
-      0;
+    New setup.
+  */
 
+  if (!previous) {
+    state.activeSignal =
+      signal;
 
-    if (
-      signal.rank >
-      previousRank
-    ) {
-      state.activeSetup =
-        {
-          ...signal,
-          ...analysis,
-          upgraded: true
-        };
+    state.lastSignalKey =
+      key;
 
+    addSignalHistory(
+      signal
+    );
 
-      notifySignal(
-        signal,
-        true
-      );
-    }
+    notifySignal(
+      signal,
+      "NEW"
+    );
+
+    updateSignalDashboard(
+      signal
+    );
 
     return;
   }
 
-
   /*
-   * New setup.
-   */
-  state.activeSetup =
-    {
-      ...signal,
-      ...analysis
-    };
-
-
-  state.lastSignal =
-    signal;
-
-
-  state.lastSignalKey =
-    key;
-
-
-  state.signalHistory.unshift({
-    ...signal,
-
-    timestamp:
-      Date.now()
-  });
-
+    Different direction:
+    replace only when new signal is stronger.
+  */
 
   if (
-    state.signalHistory.length >
-    50
+    previous.direction !==
+    signal.direction
   ) {
-    state.signalHistory.pop();
+    state.activeSignal =
+      signal;
+
+    state.lastSignalKey =
+      key;
+
+    addSignalHistory(
+      signal
+    );
+
+    notifySignal(
+      signal,
+      "NEW DIRECTION"
+    );
+
+    updateSignalDashboard(
+      signal
+    );
+
+    return;
   }
 
+  /*
+    Same direction and timeframe:
+    upgrade when confirmation improves.
+  */
 
-  notifySignal(
-    signal,
-    false
+  const oldRank =
+    rank[previous.grade] || 0;
+
+  const newRank =
+    rank[signal.grade] || 0;
+
+  if (
+    newRank > oldRank
+  ) {
+    state.activeSignal =
+      signal;
+
+    state.lastSignalKey =
+      key;
+
+    addSignalHistory(
+      signal
+    );
+
+    notifySignal(
+      signal,
+      `UPGRADED ${previous.grade} → ${signal.grade}`
+    );
+
+    updateSignalDashboard(
+      signal
+    );
+
+    return;
+  }
+
+  /*
+    Refresh price/levels without generating
+    duplicate notifications.
+  */
+
+  state.activeSignal = {
+    ...previous,
+    ...signal
+  };
+
+  updateSignalDashboard(
+    state.activeSignal
   );
-
-
-  updateSignalHistoryUI();
 }
 
 
@@ -3681,579 +3081,400 @@ function processSignal(
    ============================================================ */
 
 function checkSignalInvalidation() {
-  const setup =
-    state.activeSetup;
+  const signal =
+    state.activeSignal;
 
-
-  if (!setup) return;
-
-
-  if (
-    !setup.levels ||
-    state.livePrice == null
-  ) {
-    return;
-  }
-
+  if (!signal) return;
 
   const price =
     state.livePrice;
 
-
-  const sl =
-    setup.levels.sl;
-
+  if (!Number.isFinite(price)) {
+    return;
+  }
 
   let invalid = false;
 
-
   if (
-    setup.direction ===
-    "BULLISH" &&
-    price <= sl
+    signal.direction === "BUY" &&
+    price <= signal.sl
   ) {
     invalid = true;
   }
 
-
   if (
-    setup.direction ===
-    "BEARISH" &&
-    price >= sl
+    signal.direction === "SELL" &&
+    price >= signal.sl
   ) {
     invalid = true;
   }
 
+  if (!invalid) return;
 
-  if (invalid) {
-    state.activeSetup =
-      null;
+  state.activeSignal = null;
 
-    setAnalysisStatus(
-      "Previous setup invalidated. Monitoring for a new setup."
-    );
-  }
-}
-
-
-/* ============================================================
-   NOTIFICATIONS
-   ============================================================ */
-
-function notifySignal(
-  signal,
-  isUpgrade
-) {
-  if (
-    !state.alertsEnabled
-  ) {
-    return;
-  }
-
-
-  const key =
-    [
-      signal.symbol,
-      signal.timeframe,
-      signal.direction,
-      signal.grade
-    ].join("|");
-
-
-  const previous =
-    state.notifiedSignals.get(
-      key
-    );
-
-
-  if (
-    previous &&
-    Date.now() -
-      previous <
-      CONFIG.DUPLICATE_COOLDOWN
-  ) {
-    return;
-  }
-
-
-  state.notifiedSignals.set(
-    key,
-    Date.now()
+  text(
+    "#signal",
+    "INVALIDATED"
   );
 
-
-  const title =
-    isUpgrade
-      ? `SIGNAL UPGRADE — ${signal.grade}`
-      : `${signal.signal} — ${signal.grade}`;
-
-
-  const message =
-    `${signal.symbol} | ` +
-    `${signal.timeframe} | ` +
-    `${signal.signal} | ` +
-    `${signal.grade}`;
-
-
-  showInAppAlert(
-    title,
-    message
+  text(
+    "#direction",
+    `${signal.direction} — ${signal.timeframe}`
   );
 
-
-  if (
-    "Notification" in window
-  ) {
-    if (
-      Notification.permission ===
-      "granted"
-    ) {
-      new Notification(
-        title,
-        {
-          body: message
-        }
-      );
-    }
-  }
-}
-
-
-async function requestNotificationPermission() {
-  if (
-    !("Notification" in window)
-  ) {
-    return;
-  }
-
-
-  if (
-    Notification.permission ===
-    "default"
-  ) {
-    try {
-      await Notification.requestPermission();
-    } catch (_) {}
-  }
-}
-
-
-/* ============================================================
-   UI — CONNECTION
-   ============================================================ */
-
-function updateConnectionUI(
-  text,
-  live
-) {
-  setText(
-    "#connectionText",
-    text
+  text(
+    "#setup",
+    "SETUP INVALIDATED"
   );
 
-
-  const dot =
-    $(".status-dot");
-
-
-  if (dot) {
-    dot.classList.toggle(
-      "live",
-      Boolean(live)
-    );
-  }
-}
-
-
-/* ============================================================
-   UI — PRICE
-   ============================================================ */
-
-function updatePriceUI(price) {
-  const value =
-    round(
-      price,
-      5
-    );
-
-
-  setText(
-    "#price",
-    value
-  );
-
-
-  setText(
-    "#livePrice",
-    value
-  );
-
-
-  const selected =
-    $("#selectedMarket");
-
-
-  if (
-    selected &&
-    state.selectedSymbol
-  ) {
-    selected.textContent =
-      state.selectedSymbol;
-  }
-}
-
-
-/* ============================================================
-   UI — STATUS
-   ============================================================ */
-
-function setAnalysisStatus(
-  text
-) {
-  setText(
-    "#analysisStatus",
-    text
-  );
-
-  setText(
-    "#engineStatus",
-    text
+  text(
+    "#explanationText",
+    `${signal.symbol} ${signal.timeframe} setup invalidated because price crossed the stop level.`
   );
 }
 
 
 /* ============================================================
-   UI — DASHBOARD
+   DASHBOARD UPDATE
    ============================================================ */
 
 function updateDashboard(
   analysis
 ) {
-  if (!analysis) return;
+  const tf =
+    analysis.timeframe;
 
+  const symbol =
+    analysis.symbol;
 
-  const signal =
-    analysis.signal;
+  const price =
+    analysis.price;
 
+  updateChosenPairDisplay();
 
-  const primary =
-    analysis.topDown.primary;
+  updateMarketName();
 
+  updateLivePrice(
+    price
+  );
 
   /*
-   * Signal
-   */
-  setText(
-    "#signal",
-    signal.signal
-  );
+    Explicitly display selected timeframe.
+  */
 
-
-  setText(
-    "#direction",
-    signal.direction ||
-      signal.signal
-  );
-
-
-  setText(
-    "#setup",
-    signal.grade
-  );
-
-
-  setText(
-    "#confidence",
-    signal.score != null
-      ? `${signal.score}/15`
-      : "—"
-  );
-
-
-  setText(
-    "#rr",
-    signal.levels
-      ? `1:${signal.levels.rrTP2}`
-      : "—"
-  );
-
-
-  /*
-   * Selected timeframe
-   */
-  setText(
-    "#selectedTimeframe",
-    analysis.timeframe
-  );
-
-
-  setText(
+  const timeframeSelectors = [
     "#analysisTimeframe",
-    analysis.timeframe
-  );
+    "#selectedTimeframe",
+    "#signalTimeframe"
+  ];
 
+  timeframeSelectors.forEach(selector => {
+    const el = $(selector);
 
-  /*
-   * Trade levels
-   */
-  const levels =
-    signal.levels;
+    if (el) {
+      el.textContent =
+        tf;
+    }
+  });
 
+  const result =
+    analysis.result;
 
-  if (levels) {
-    setText(
-      "#entry",
-      levels.entry
-    );
-
-    setText(
-      "#sl",
-      levels.sl
-    );
-
-    setText(
-      "#be",
-      levels.be
-    );
-
-    setText(
-      "#tp1",
-      levels.tp1
-    );
-
-    setText(
-      "#tp2",
-      levels.tp2
+  if (
+    result?.signal
+  ) {
+    updateSignalDashboard(
+      result.signal
     );
   }
-
-
-  /*
-   * Structure
-   */
-  if (primary) {
-    setText(
-      "#swing",
-      primary.structure?.bias ||
-        "NEUTRAL"
-    );
-
-
-    setText(
-      "#structure",
-      primary.events?.bos
-        ? primary.events.bos.type
-        : primary.structure?.bias ||
-          "NONE"
-    );
-
-
-    setText(
-      "#liquidity",
-      primary.liquidity?.swept
-        ? primary.liquidity.type
-        : "NONE"
-    );
-
-
-    setText(
-      "#sr",
-      formatSR(
-        primary.supportResistance
-      )
-    );
-
-
-    /*
-     * Candlestick
-     */
-    setText(
-      "#pattern",
-      primary.candleConfirmation
-        ?.pattern ||
-        "NONE"
-    );
-
-
-    setText(
-      "#rejection",
-      primary.candleConfirmation
-        ?.confirmed
-        ? "CONFIRMED"
-        : "WAITING"
-    );
-
-
-    setText(
-      "#momentum",
-      primary.displacement
-        ? primary.displacement.direction
-        : "NONE"
-    );
-
-
-    setText(
-      "#confirmation",
-      primary.candleConfirmation
-        ?.confirmed
-        ? "CONFIRMED"
-        : "WAITING"
-    );
-  }
-
-
-  /*
-   * Explanation
-   */
-  setText(
-    "#explanationText",
-    signal.explanation ||
-      signal.reason ||
-      "Monitoring market structure."
-  );
-
-
-  setAnalysisStatus(
-    `${analysis.symbol} — ${analysis.timeframe} — ${signal.signal} ${signal.grade}`
-  );
-
-
-  updateMarketInsightUI(
-    analysis.marketInsight
-  );
-
-
-  updateSignalHistoryUI();
-}
-
-
-function formatSR(sr) {
-  if (!sr) return "NONE";
-
-  const support =
-    sr.support != null
-      ? round(sr.support)
-      : "—";
-
-  const resistance =
-    sr.resistance != null
-      ? round(sr.resistance)
-      : "—";
-
-  return `S: ${support} | R: ${resistance}`;
 }
 
 
 /* ============================================================
-   MARKET INSIGHT UI
+   SIGNAL CARD
    ============================================================ */
 
-function updateMarketInsightUI(
-  insight
+function updateSignalDashboard(
+  signal
 ) {
-  if (!insight) return;
+  if (!signal) return;
 
+  const directionText =
+    `${signal.direction} • ${signal.timeframe}`;
 
-  setText(
-    "#marketBias",
-    insight.bias
+  text(
+    "#signal",
+    directionText
   );
 
-
-  setText(
-    "#htfBias",
-    insight.htfBias
+  text(
+    "#direction",
+    `${signal.direction} — ${signal.timeframe}`
   );
 
-
-  setText(
-    "#marketStructure",
-    insight.structure
+  text(
+    "#setup",
+    `${signal.grade} SETUP • ${signal.timeframe}`
   );
 
-
-  setText(
-    "#bos",
-    insight.bos
+  text(
+    "#confidence",
+    `${signal.confidence}%`
   );
 
-
-  setText(
-    "#choch",
-    insight.choch
+  text(
+    "#rr",
+    `1:${signal.rr}`
   );
 
-
-  setText(
-    "#marketLiquidity",
-    insight.liquidity
+  text(
+    "#entry",
+    formatPrice(
+      signal.entry
+    )
   );
 
-
-  setText(
-    "#marketSupport",
-    insight.support != null
-      ? round(insight.support)
-      : "—"
+  text(
+    "#sl",
+    formatPrice(
+      signal.sl
+    )
   );
 
-
-  setText(
-    "#marketResistance",
-    insight.resistance != null
-      ? round(insight.resistance)
-      : "—"
+  text(
+    "#tp1",
+    formatPrice(
+      signal.tp1
+    )
   );
 
+  text(
+    "#tp2",
+    formatPrice(
+      signal.tp2
+    )
+  );
 
-  setText(
-    "#marketCandle",
-    insight.candle
+  text(
+    "#swing",
+    signal.structure ||
+      "N/A"
+  );
+
+  text(
+    "#structure",
+    signal.bos ||
+      signal.choch ||
+      signal.structure ||
+      "WAITING"
+  );
+
+  text(
+    "#liquidity",
+    signal.liquidity?.type ||
+      "WAITING"
+  );
+
+  text(
+    "#sr",
+    "ACTIVE"
+  );
+
+  text(
+    "#pattern",
+    signal.candle?.pattern ||
+      "WAITING"
+  );
+
+  text(
+    "#rejection",
+    signal.candle?.rejection
+      ? "CONFIRMED"
+      : "WAITING"
+  );
+
+  text(
+    "#momentum",
+    signal.candle?.momentum
+      ? "CONFIRMED"
+      : "WAITING"
+  );
+
+  text(
+    "#confirmation",
+    signal.candle?.confirmed
+      ? "CONFIRMED"
+      : "WAITING"
+  );
+
+  text(
+    "#explanationText",
+    signal.explanation
+  );
+
+  updateChosenPairDisplay();
+
+  /*
+    Add timeframe to signal card title
+    if such an element exists.
+  */
+
+  const label =
+    $("#signalLabel");
+
+  if (label) {
+    label.textContent =
+      `${getMarketDisplayName(signal.symbol)} — ${signal.timeframe}`;
+  }
+}
+
+
+/* ============================================================
+   WAITING / NO SETUP
+   ============================================================ */
+
+function setWaitingState(
+  status,
+  reason
+) {
+  const tf =
+    getSelectedTimeframe();
+
+  const symbol =
+    state.selectedSymbol ||
+    $("#market")?.value ||
+    "MARKET";
+
+  updateChosenPairDisplay();
+
+  if (status === "NO SETUP") {
+    text(
+      "#signal",
+      `NO SETUP — ${tf}`
+    );
+
+    text(
+      "#direction",
+      `WAIT — ${tf}`
+    );
+
+    text(
+      "#setup",
+      `NO CONFIRMED SETUP — ${tf}`
+    );
+  } else {
+    text(
+      "#signal",
+      `${status} — ${tf}`
+    );
+
+    text(
+      "#direction",
+      `WAIT — ${tf}`
+    );
+
+    text(
+      "#setup",
+      `${status} — ${tf}`
+    );
+  }
+
+  text(
+    "#confidence",
+    "--"
+  );
+
+  text(
+    "#rr",
+    "--"
+  );
+
+  text(
+    "#explanationText",
+    reason ||
+      `${symbol} is being analyzed on ${tf}.`
   );
 }
 
 
 /* ============================================================
-   SIGNAL HISTORY UI
+   SIGNAL HISTORY
    ============================================================ */
 
-function updateSignalHistoryUI() {
+function addSignalHistory(
+  signal
+) {
+  const key =
+    `${signal.symbol}_${signal.timeframe}_${signal.direction}_${signal.grade}`;
+
+  const duplicate =
+    state.signalHistory.some(
+      item => item.key === key
+    );
+
+  if (duplicate) return;
+
+  state.signalHistory.unshift({
+    key,
+
+    symbol:
+      signal.symbol,
+
+    timeframe:
+      signal.timeframe,
+
+    direction:
+      signal.direction,
+
+    grade:
+      signal.grade,
+
+    entry:
+      signal.entry,
+
+    sl:
+      signal.sl,
+
+    tp1:
+      signal.tp1,
+
+    tp2:
+      signal.tp2,
+
+    createdAt:
+      signal.createdAt
+  });
+
+  state.signalHistory =
+    state.signalHistory.slice(
+      0,
+      50
+    );
+
+  renderSignalHistory();
+}
+
+
+function renderSignalHistory() {
   const container =
     $("#signalHistory");
 
-
   if (!container) return;
 
-
   container.innerHTML = "";
-
 
   state.signalHistory
     .slice(0, 20)
     .forEach(item => {
       const row =
-        document.createElement(
-          "div"
-        );
-
+        document.createElement("div");
 
       row.className =
         "signal-history-item";
 
-
-      const time =
-        new Date(
-          item.timestamp
-        ).toLocaleTimeString();
-
-
       row.textContent =
-        `${time} — ` +
-        `${item.symbol} — ` +
-        `${item.timeframe} — ` +
-        `${item.signal} — ` +
-        `${item.grade}`;
-
+        `${item.symbol} • ${item.timeframe} • ${item.direction} • ${item.grade} • Entry ${formatPrice(item.entry)}`;
 
       container.appendChild(row);
     });
@@ -4261,87 +3482,156 @@ function updateSignalHistoryUI() {
 
 
 /* ============================================================
-   IN-APP ALERT
+   ALERTS
    ============================================================ */
+
+function notifySignal(
+  signal,
+  eventType
+) {
+  if (!state.alertsEnabled) {
+    return;
+  }
+
+  const key =
+    `${signal.symbol}_${signal.timeframe}_${signal.direction}_${signal.grade}_${eventType}`;
+
+  const last =
+    state.notifiedSignals.get(key);
+
+  if (
+    last &&
+    now() - last <
+      CONFIG.DUPLICATE_COOLDOWN
+  ) {
+    return;
+  }
+
+  state.notifiedSignals.set(
+    key,
+    now()
+  );
+
+  const title =
+    `SUCCESSFUL PINE SCRIPT — ${signal.grade}`;
+
+  const message =
+    `${signal.symbol} • ${signal.timeframe}\n` +
+    `${signal.direction}\n` +
+    `Entry: ${formatPrice(signal.entry)}\n` +
+    `SL: ${formatPrice(signal.sl)}\n` +
+    `TP1: ${formatPrice(signal.tp1)}\n` +
+    `TP2: ${formatPrice(signal.tp2)}`;
+
+  showInAppAlert(
+    title,
+    message
+  );
+
+  sendBrowserNotification(
+    title,
+    message
+  );
+}
+
 
 function showInAppAlert(
   title,
   message
 ) {
-  let container =
-    $("#signalAlert");
+  let box =
+    $("#precisionAlert");
 
+  if (!box) {
+    box =
+      document.createElement("div");
 
-  if (!container) {
-    container =
-      document.createElement(
-        "div"
-      );
+    box.id =
+      "precisionAlert";
 
-    container.id =
-      "signalAlert";
-
-    container.style.position =
+    box.style.position =
       "fixed";
 
-    container.style.top =
-      "20px";
+    box.style.right =
+      "16px";
 
-    container.style.right =
-      "20px";
+    box.style.bottom =
+      "16px";
 
-    container.style.zIndex =
+    box.style.zIndex =
       "99999";
 
+    box.style.maxWidth =
+      "360px";
+
+    box.style.padding =
+      "14px";
+
+    box.style.borderRadius =
+      "12px";
+
+    box.style.background =
+      "#111";
+
+    box.style.color =
+      "#fff";
+
+    box.style.whiteSpace =
+      "pre-line";
+
     document.body.appendChild(
-      container
+      box
     );
   }
 
+  box.textContent =
+    `${title}\n${message}`;
 
-  const alert =
-    document.createElement(
-      "div"
-    );
-
-
-  alert.style.padding =
-    "14px";
-
-
-  alert.style.marginBottom =
-    "8px";
-
-
-  alert.style.borderRadius =
-    "10px";
-
-
-  alert.style.background =
-    "#111";
-
-
-  alert.style.color =
-    "#fff";
-
-
-  alert.style.boxShadow =
-    "0 5px 20px rgba(0,0,0,.3)";
-
-
-  alert.innerHTML =
-    `<strong>${escapeHTML(title)}</strong>
-     <div>${escapeHTML(message)}</div>`;
-
-
-  container.appendChild(
-    alert
-  );
-
+  box.style.display =
+    "block";
 
   setTimeout(() => {
-    alert.remove();
-  }, 7000);
+    box.style.display =
+      "none";
+  }, 10000);
+}
+
+
+async function sendBrowserNotification(
+  title,
+  body
+) {
+  if (
+    !("Notification" in window)
+  ) {
+    return;
+  }
+
+  try {
+    if (
+      Notification.permission ===
+      "default"
+    ) {
+      await Notification.requestPermission();
+    }
+
+    if (
+      Notification.permission ===
+      "granted"
+    ) {
+      new Notification(
+        title,
+        {
+          body
+        }
+      );
+    }
+  } catch (error) {
+    console.warn(
+      "Notification error:",
+      error
+    );
+  }
 }
 
 
@@ -4351,17 +3641,14 @@ function showInAppAlert(
 
 function createAlertControl() {
   const existing =
-    $("#alertControl");
-
+    $("#alertToggle");
 
   if (existing) {
     existing.addEventListener(
       "click",
-      async () => {
+      () => {
         state.alertsEnabled =
           !state.alertsEnabled;
-
-        await requestNotificationPermission();
 
         existing.textContent =
           state.alertsEnabled
@@ -4373,54 +3660,37 @@ function createAlertControl() {
     return;
   }
 
-
   /*
-   * Do not modify the user's layout unnecessarily.
-   *
-   * If no existing alert button exists,
-   * create a small fixed control.
-   */
-  const button =
-    document.createElement(
-      "button"
-    );
+    Only create the control if there
+    isn't already one.
+  */
 
+  const button =
+    document.createElement("button");
 
   button.id =
-    "alertControl";
-
+    "alertToggle";
 
   button.textContent =
     "🔔 Alerts ON";
 
-
   button.style.position =
     "fixed";
 
+  button.style.left =
+    "12px";
 
   button.style.bottom =
-    "20px";
-
-
-  button.style.right =
-    "20px";
-
+    "12px";
 
   button.style.zIndex =
     "9999";
 
-
   button.addEventListener(
     "click",
-    async () => {
+    () => {
       state.alertsEnabled =
         !state.alertsEnabled;
-
-      if (
-        state.alertsEnabled
-      ) {
-        await requestNotificationPermission();
-      }
 
       button.textContent =
         state.alertsEnabled
@@ -4429,7 +3699,6 @@ function createAlertControl() {
     }
   );
 
-
   document.body.appendChild(
     button
   );
@@ -4437,113 +3706,134 @@ function createAlertControl() {
 
 
 /* ============================================================
-   AI QUESTION BAR
+   QUESTION BAR
    ============================================================ */
 
 function createQuestionBar() {
   if (
-    $("#aiQuestionBar") ||
-    $("#questionBar")
+    $("#aiQuestion") ||
+    $("#questionInput")
   ) {
+    setupExistingQuestionBar();
     return;
   }
 
-
   const wrapper =
-    document.createElement(
-      "div"
-    );
-
+    document.createElement("div");
 
   wrapper.id =
-    "aiQuestionBar";
-
+    "successfulAIQuestionBar";
 
   wrapper.style.margin =
     "20px 0";
 
-
   wrapper.innerHTML = `
-    <div style="
-      display:flex;
-      gap:8px;
-      align-items:center;
-      flex-wrap:wrap;
-    ">
+    <div style="display:flex;gap:8px;align-items:center;">
       <input
         id="aiQuestion"
         type="text"
-        placeholder="Ask Successful AI about the current market..."
-        style="
-          flex:1;
-          min-width:220px;
-          padding:12px;
-        "
+        placeholder="Ask Successful AI about this live market..."
+        style="flex:1;"
       />
 
-      <button id="askAIButton">
+      <button id="aiAskButton">
         Ask AI
       </button>
     </div>
 
     <div
       id="aiAnswer"
-      style="
-        margin-top:10px;
-        white-space:pre-wrap;
-      "
-    ></div>
+      style="margin-top:10px;white-space:pre-line;"
+    >
+      Ask a question about the selected market or setup.
+    </div>
   `;
 
-
   const target =
-    document.querySelector(
-      "main"
-    ) ||
+    $(".container") ||
+    $("main") ||
     document.body;
-
 
   target.appendChild(
     wrapper
   );
 
-
   const input =
     $("#aiQuestion");
 
-
   const button =
-    $("#askAIButton");
+    $("#aiAskButton");
 
-
-  button.addEventListener(
-    "click",
-    () => {
-      askSuccessfulAI(
-        input.value
-      );
-    }
-  );
-
-
-  input.addEventListener(
-    "keydown",
-    event => {
-      if (
-        event.key ===
-        "Enter"
-      ) {
+  if (button) {
+    button.addEventListener(
+      "click",
+      () => {
         askSuccessfulAI(
-          input.value
+          input?.value || ""
         );
       }
-    }
-  );
+    );
+  }
+
+  if (input) {
+    input.addEventListener(
+      "keydown",
+      event => {
+        if (
+          event.key ===
+          "Enter"
+        ) {
+          askSuccessfulAI(
+            input.value
+          );
+        }
+      }
+    );
+  }
+}
+
+
+function setupExistingQuestionBar() {
+  const input =
+    $("#aiQuestion") ||
+    $("#questionInput");
+
+  const button =
+    $("#aiAskButton") ||
+    $("#askAI") ||
+    $("#askButton");
+
+  if (button) {
+    button.addEventListener(
+      "click",
+      () => {
+        askSuccessfulAI(
+          input?.value || ""
+        );
+      }
+    );
+  }
+
+  if (input) {
+    input.addEventListener(
+      "keydown",
+      event => {
+        if (
+          event.key ===
+          "Enter"
+        ) {
+          askSuccessfulAI(
+            input.value
+          );
+        }
+      }
+    );
+  }
 }
 
 
 /* ============================================================
-   AI QUESTION FUNCTION
+   AI QUESTION BAR
    ============================================================ */
 
 async function askSuccessfulAI(
@@ -4554,63 +3844,72 @@ async function askSuccessfulAI(
       question || ""
     ).trim();
 
-
   if (!question) {
     return;
   }
 
-
   const answerBox =
     $("#aiAnswer") ||
     $("#answer");
-
 
   if (answerBox) {
     answerBox.textContent =
       "Analyzing the live market data...";
   }
 
-
   const analysis =
     window.lastAnalysis ||
     window.currentAnalysis ||
-    state.analysis ||
     {};
 
+  const candles =
+    window.closedCandles ||
+    window.currentCandles ||
+    [];
+
+  const marketSelect =
+    $("#market");
+
+  const symbol =
+    marketSelect?.value ||
+    window.currentSymbol ||
+    state.selectedSymbol ||
+    "Unknown";
 
   const timeframe =
     getSelectedTimeframe();
-
-
-  const symbol =
-    state.selectedSymbol ||
-    $("#market")?.value ||
-    "Unknown";
-
-
-  const candles =
-    getClosedCandles(
-      symbol,
-      timeframe
-    );
-
 
   const market = {
     symbol,
 
     name:
-      $("#market")
+      marketSelect
         ?.selectedOptions?.[0]
         ?.textContent ||
-      "",
+      getMarketDisplayName(
+        symbol
+      ),
 
     price:
+      window.currentPrice ??
       state.livePrice ??
-      null,
-
-    timeframe
+      null
   };
 
+  const payload = {
+    question,
+
+    market,
+
+    timeframe,
+
+    granularity:
+      CONFIG.TIMEFRAMES[timeframe],
+
+    analysis,
+
+    candles
+  };
 
   try {
     const response =
@@ -4624,74 +3923,61 @@ async function askSuccessfulAI(
               "application/json"
           },
 
-          body: JSON.stringify({
-            question,
-
-            market,
-
-            timeframe,
-
-            granularity:
-              CONFIG.TIMEFRAMES[
-                timeframe
-              ],
-
-            analysis,
-
-            candles
-          })
+          body:
+            JSON.stringify(
+              payload
+            )
         }
       );
-
 
     const data =
       await response.json();
 
-
     if (!response.ok) {
       throw new Error(
         data.error ||
-        "AI request failed"
+        "AI request failed."
       );
     }
-
 
     const answer =
       data.answer ||
       data.fallback ||
       "No answer returned.";
 
-
     if (answerBox) {
       answerBox.textContent =
         answer;
     }
 
-
     window.lastAIAnswer =
       answer;
 
-
     return answer;
+
   } catch (error) {
     console.error(
-      "AI question error:",
+      "AI Question Bar error:",
       error
     );
 
+    /*
+      Local fallback keeps the Question Bar
+      useful even if /api/ask is unavailable.
+    */
 
     const fallback =
       localAIAnswer(
-        question,
-        analysis
+        question
       );
-
 
     if (answerBox) {
       answerBox.textContent =
         fallback;
     }
 
+    window.lastAIAnswer =
+      fallback;
 
     return fallback;
   }
@@ -4703,86 +3989,122 @@ async function askSuccessfulAI(
    ============================================================ */
 
 function localAIAnswer(
-  question,
-  analysis
+  question
 ) {
-  const signal =
-    analysis?.signal;
+  const analysis =
+    window.lastAnalysis;
 
-
-  const timeframe =
-    analysis?.timeframe ||
+  const tf =
     getSelectedTimeframe();
 
-
   const symbol =
-    analysis?.symbol ||
     state.selectedSymbol;
 
+  const lower =
+    question.toLowerCase();
 
-  if (!signal) {
+  if (!analysis) {
+    return `I do not have enough live ${tf} analysis data yet. Wait for the ${symbol || "selected market"} ${tf} candles to load.`;
+  }
+
+  const result =
+    analysis.result;
+
+  if (
+    lower.includes("signal") ||
+    lower.includes("trade") ||
+    lower.includes("buy") ||
+    lower.includes("sell")
+  ) {
+    if (
+      result?.signal
+    ) {
+      const s =
+        result.signal;
+
+      return (
+        `${s.symbol} is currently being analyzed on ${s.timeframe}.\n\n` +
+        `Direction: ${s.direction}\n` +
+        `Setup: ${s.grade}\n` +
+        `Entry: ${formatPrice(s.entry)}\n` +
+        `SL: ${formatPrice(s.sl)}\n` +
+        `TP1: ${formatPrice(s.tp1)}\n` +
+        `TP2: ${formatPrice(s.tp2)}\n` +
+        `RR: 1:${s.rr}\n\n` +
+        `${s.explanation}`
+      );
+    }
+
     return (
-      `No completed ${timeframe} analysis ` +
-      `is currently available for ${symbol}.`
+      `${symbol} currently has no confirmed ${tf} setup. ` +
+      `The engine is waiting for stronger price-action confirmation.`
     );
   }
 
+  if (
+    lower.includes("timeframe") ||
+    lower.includes("tf")
+  ) {
+    return (
+      `The selected analysis timeframe is ${tf}. ` +
+      `Signals and entries are generated from the ${tf} candles, while higher timeframes are used only for context.`
+    );
+  }
+
+  if (
+    lower.includes("why")
+  ) {
+    return (
+      analysis.result?.signal?.explanation ||
+      `The engine is analyzing ${symbol} on ${tf} using structure, liquidity, displacement, FVG, order block and candlestick price action.`
+    );
+  }
 
   return (
-    `${symbol} ${timeframe} insight:\n\n` +
-
-    `Signal: ${signal.signal}\n` +
-
-    `Setup: ${signal.grade}\n` +
-
-    `HTF Bias: ${
-      signal.htfBias || "NEUTRAL"
-    }\n` +
-
-    `Score: ${
-      signal.score ?? "—"
-    }\n\n` +
-
-    `${
-      signal.explanation ||
-      signal.reason ||
-      "No additional explanation."
-    }`
+    `Live ${symbol} ${tf} analysis is active. ` +
+    `Ask me about the signal, entry, SL, TP, structure, liquidity, candle confirmation, RR or why the setup is waiting.`
   );
 }
 
 
 /* ============================================================
-   UTILITIES
+   PRICE FORMAT
    ============================================================ */
 
-function escapeHTML(value) {
-  return String(value)
-    .replace(
-      /&/g,
-      "&amp;"
-    )
-    .replace(
-      /</g,
-      "&lt;"
-    )
-    .replace(
-      />/g,
-      "&gt;"
-    )
-    .replace(
-      /"/g,
-      "&quot;"
-    )
-    .replace(
-      /'/g,
-      "&#039;"
-    );
+function formatPrice(
+  price
+) {
+  const n =
+    Number(price);
+
+  if (!Number.isFinite(n)) {
+    return "--";
+  }
+
+  if (
+    Math.abs(n) >= 1000
+  ) {
+    return n.toFixed(2);
+  }
+
+  if (
+    Math.abs(n) >= 100
+  ) {
+    return n.toFixed(2);
+  }
+
+  if (
+    Math.abs(n) >= 10
+  ) {
+    return n.toFixed(3);
+  }
+
+  return n.toFixed(5);
 }
 
 
 /* ============================================================
-   CONTINUOUS INVALIDATION CHECK
+   PERIODIC INVALIDATION CHECK
    ============================================================ */
 
 setInterval(() => {
@@ -4791,29 +4113,64 @@ setInterval(() => {
 
 
 /* ============================================================
-   PUBLIC API
+   CLEAN OLD REQUESTS
+   ============================================================ */
+
+setInterval(() => {
+  const expiry =
+    30000;
+
+  const current =
+    now();
+
+  state.pendingHistory.forEach(
+    (pending, reqId) => {
+      if (
+        current -
+          pending.createdAt >
+        expiry
+      ) {
+        state.pendingHistory.delete(
+          reqId
+        );
+
+        state.historyRequests.delete(
+          reqId
+        );
+
+        pending.reject(
+          new Error(
+            "Deriv history request timed out."
+          )
+        );
+      }
+    }
+  );
+}, 10000);
+
+
+/* ============================================================
+   GLOBAL API
    ============================================================ */
 
 window.SuccessfulPrecisionAI = {
   state,
 
+  CONFIG,
+
   connectDeriv,
+
+  selectTimeframe,
 
   runPrecisionAnalysis,
 
-  analyzeTimeframe,
-
-  getSelectedTimeframe,
-
-  setSelectedTimeframe,
-
   loadTimeframeHistory,
 
-  loadRequiredTimeframes,
-
-  ensureTimeframeData,
-
   getClosedCandles,
+
+  analyzeTimeframe,
+
+  buildTopDownAnalysis,
 
   generatePrecisionSignal,
 
@@ -4822,32 +4179,29 @@ window.SuccessfulPrecisionAI = {
 
 
 /* ============================================================
-   GLOBALS FOR EXISTING UI / AI BAR / CHARTS
-   ============================================================ */
-
-window.askSuccessfulAI =
-  askSuccessfulAI;
-
-window.runPrecisionAnalysis =
-  runPrecisionAnalysis;
-
-window.getSelectedTimeframe =
-  getSelectedTimeframe;
-
-window.getClosedCandles =
-  getClosedCandles;
-
-
-/* ============================================================
-   INITIAL GLOBAL STATE
+   GLOBAL VARIABLES FOR EXISTING UI / QUESTION BAR
    ============================================================ */
 
 window.lastAnalysis = null;
 window.currentAnalysis = null;
 window.currentSymbol = "";
 window.currentPrice = null;
+window.currentTimeframe =
+  state.selectedTimeframe;
 window.closedCandles = [];
 
+window.askSuccessfulAI =
+  askSuccessfulAI;
+
+
 /* ============================================================
-   END SUCCESSFUL PINE SCRIPT
+   INITIAL TIMEFRAME BUTTON STATE
+   ============================================================ */
+
+updateTimeframeButtons();
+updateChosenPairDisplay();
+
+
+/* ============================================================
+   END
    ============================================================ */
