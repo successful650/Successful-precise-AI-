@@ -1,47 +1,37 @@
 /* ============================================================
    SUCCESSFUL PINE SCRIPT
-   PRECISION SNIPER AI
+   PRECISION SIGNAL ENGINE
    ------------------------------------------------------------
-   Strategy:
-   SWING → DIRECTION → CONFIRMATION → ENTRY → SL → TP
-
-   NON-REPAINTING:
-   - CLOSED CANDLES ONLY
-   - NO INTRABAR CONFIRMED SIGNALS
-   - CONFIRMED ENTRY/SL/TP ARE FROZEN
-   - NO FUTURE DATA
-   - CONFIRMED SWINGS ONLY
-   - TIMEFRAME-SPECIFIC ANALYSIS
-   - NO OLD-TIMEFRAME SIGNALS AFTER TF CHANGE
-
-   LIVE DATA:
-   Deriv public WebSocket
+   LIVE DERIV PUBLIC DATA
+   ALL PAIRS × ALL TIMEFRAMES BACKGROUND SCANNER
+   CLOSED-CANDLE / NON-REPAINTING
+   MARKET STRUCTURE + PRICE ACTION + S/R + EMA9
+   DEPTH 30 / DEVIATION 5 / BACKSTEP 5
+   SNIPER ENTRY + SL + TP1 + TP2 + TP3
+   NO FUTURE DATA / NO LOOKAHEAD
    ============================================================ */
 
 "use strict";
 
 /* ============================================================
-   CONFIG
+   CONFIGURATION
    ============================================================ */
 
 const CONFIG = {
-  DERIV_WS: "wss://api.derivws.com/trading/v1/options/ws/public",
+  DERIV_WS:
+    "wss://api.derivws.com/trading/v1/options/ws/public",
 
-  HISTORY_COUNT: 1000,
+  HISTORY_COUNT: 250,
 
-  // SignalLib-style swing parameters
   DEPTH: 30,
   DEVIATION: 5,
   BACKSTEP: 5,
 
-  // Simple confirmation
   EMA_LENGTH: 9,
-
-  // ATR safety check
   ATR_LENGTH: 14,
+
   ATR_SAFETY_MULTIPLIER: 0.15,
 
-  // Targets
   TP1_RR: 1,
   TP2_RR: 2,
   TP3_RR: 3,
@@ -57,59 +47,122 @@ const CONFIG = {
     Daily: 86400
   },
 
+  /* ==========================================================
+     FULL SCANNER
+     ========================================================== */
+
+  SCANNER_ENABLED: true,
+
+  SCANNER_ALL_SYMBOLS: true,
+
+  SCANNER_ALL_TIMEFRAMES: true,
+
+  SCANNER_BATCH_SIZE: 3,
+
+  SCANNER_DELAY: 250,
+
+  SCANNER_HISTORY_COUNT: 250,
+
+  /* Do not alert historical setup during initial baseline. */
+  BASELINE_WITHOUT_ALERT: true,
+
+  /* Prevent repeated alerts for same setup. */
+  SIGNAL_COOLDOWN: 60 * 60 * 1000,
+
   RECONNECT_MIN: 1000,
+
   RECONNECT_MAX: 30000,
 
+  /* Selected pair analysis frequency. */
   ANALYSIS_INTERVAL: 5000,
 
-  SIGNAL_COOLDOWN: 60 * 60 * 1000
+  /* Maximum number of history requests waiting at once. */
+  MAX_PENDING_HISTORY: 6
 };
 
 
 /* ============================================================
-   STATE
+   GLOBAL STATE
    ============================================================ */
 
 const state = {
+
   ws: null,
 
   connected: false,
+
   reconnectTimer: null,
+
   reconnectDelay: CONFIG.RECONNECT_MIN,
 
   symbols: [],
+
   selectedSymbol: "",
+
   selectedTimeframe: "M5",
 
   livePrice: null,
 
-  /*
-    candles[symbol][timeframe] = {
-      candles: [],
-      updatedAt: timestamp
-    }
-  */
   candles: {},
 
   pendingRequests: new Map(),
+
+  pendingHistory: new Map(),
+
   requestId: 1,
 
   analysis: null,
+
   activeSignal: null,
 
   signalHistory: [],
+
   notifiedSignals: new Set(),
 
   alertsEnabled: true,
 
   analysisGeneration: 0,
+
   analysisRunning: false,
 
   lastClosedCandleTime: {},
 
   tradeState: null,
 
-  initialized: false
+  initialized: false,
+
+  /* ==========================================================
+     FULL SCANNER STATE
+     ========================================================== */
+
+  scannerRunning: false,
+
+  scannerBusy: false,
+
+  scannerQueue: [],
+
+  scannerQueueIndex: 0,
+
+  scannerLastClosedCandle: {},
+
+  scannerSignals: {},
+
+  scannerSeenSignals: new Set(),
+
+  scannerNotifiedSignals: new Set(),
+
+  scannerInitialized: {},
+
+  scannerGeneration: 0,
+
+  scannerStats: {
+    pairs: 0,
+    timeframes: 0,
+    combinations: 0,
+    scanned: 0,
+    signals: 0,
+    lastRun: null
+  }
 };
 
 
@@ -117,26 +170,97 @@ const state = {
    DOM HELPERS
    ============================================================ */
 
-function $(selector) {
-  return document.querySelector(selector);
+function $(id) {
+  return document.getElementById(id);
 }
+
 
 function $all(selector) {
   return Array.from(document.querySelectorAll(selector));
 }
 
-function setText(selector, value) {
-  const el = $(selector);
-  if (el) el.textContent = value;
+
+function setText(id, value) {
+
+  const element = $(id);
+
+  if (element) {
+    element.textContent =
+      value === undefined ||
+      value === null
+        ? ""
+        : String(value);
+  }
 }
 
+
 function escapeHTML(value) {
+
   return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+
+/* ============================================================
+   NUMBER HELPERS
+   ============================================================ */
+
+function isFiniteNumber(value) {
+  return Number.isFinite(Number(value));
+}
+
+
+function toNumber(value) {
+  const number = Number(value);
+
+  return Number.isFinite(number)
+    ? number
+    : null;
+}
+
+
+function roundPrice(price) {
+
+  if (!isFiniteNumber(price)) {
+    return null;
+  }
+
+  const p = Math.abs(Number(price));
+
+  let decimals = 5;
+
+  if (p >= 1000) decimals = 2;
+  else if (p >= 100) decimals = 3;
+  else if (p >= 10) decimals = 4;
+
+  return Number(Number(price).toFixed(decimals));
+}
+
+
+function formatPrice(price) {
+
+  if (!isFiniteNumber(price)) {
+    return "—";
+  }
+
+  const p = Math.abs(Number(price));
+
+  let decimals = 5;
+
+  if (p >= 1000) decimals = 2;
+  else if (p >= 100) decimals = 3;
+  else if (p >= 10) decimals = 4;
+
+  return Number(price).toFixed(decimals);
+}
+
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 
@@ -145,160 +269,62 @@ function escapeHTML(value) {
    ============================================================ */
 
 function normalizeTimeframe(value) {
-  if (!value) return null;
 
-  const raw = String(value).trim();
+  const raw = String(value || "")
+    .trim()
+    .toUpperCase();
 
-  const map = {
-    "1": "M1",
-    "1M": "M1",
-    "M1": "M1",
+  if (raw === "D1") return "Daily";
 
-    "5": "M5",
-    "5M": "M5",
-    "M5": "M5",
+  if (raw === "1D") return "Daily";
 
-    "15": "M15",
-    "15M": "M15",
-    "M15": "M15",
+  if (raw === "DAY") return "Daily";
 
-    "30": "M30",
-    "30M": "M30",
-    "M30": "M30",
+  if (CONFIG.TIMEFRAMES[raw]) {
+    return raw;
+  }
 
-    "60": "H1",
-    "1H": "H1",
-    "H1": "H1",
-
-    "120": "H2",
-    "2H": "H2",
-    "H2": "H2",
-
-    "240": "H4",
-    "4H": "H4",
-    "H4": "H4",
-
-    "D": "Daily",
-    "DAY": "Daily",
-    "DAILY": "Daily"
-  };
-
-  return map[raw.toUpperCase()] || null;
+  return "M5";
 }
 
 
-function getSelectedTimeframe() {
-  return normalizeTimeframe(state.selectedTimeframe) || "M5";
+function getTimeframeSeconds(timeframe) {
+
+  const tf = normalizeTimeframe(timeframe);
+
+  return CONFIG.TIMEFRAMES[tf];
 }
 
 
-function getSelectedGranularity() {
-  return CONFIG.TIMEFRAMES[getSelectedTimeframe()];
+function getTimeframeLabel(timeframe) {
+
+  return normalizeTimeframe(timeframe);
+}
+
+
+function getAllTimeframes() {
+
+  return Object.keys(CONFIG.TIMEFRAMES);
 }
 
 
 /* ============================================================
-   TIMEFRAME UI
+   EXPECTED CLOSED CANDLE
    ============================================================ */
 
-function updateTimeframeButtons() {
-  const tf = getSelectedTimeframe();
+function getExpectedLatestClosedEpoch(timeframe) {
 
-  $all("[data-timeframe]").forEach(button => {
-    const buttonTF = normalizeTimeframe(
-      button.dataset.timeframe ||
-      button.value ||
-      button.textContent
-    );
+  const duration =
+    getTimeframeSeconds(timeframe);
 
-    button.classList.toggle("active", buttonTF === tf);
+  if (!duration) return 0;
 
-    if (buttonTF === tf) {
-      button.setAttribute("aria-selected", "true");
-    } else {
-      button.setAttribute("aria-selected", "false");
-    }
-  });
+  const now =
+    Math.floor(Date.now() / 1000);
 
-  const select = $("#timeframe");
-
-  if (select && normalizeTimeframe(select.value)) {
-    select.value = tf;
-  }
-}
-
-
-/* ============================================================
-   CHOSEN PAIR DISPLAY
-   ============================================================ */
-
-function getSelectedMarketName() {
-  const select = $("#market");
-
-  if (!select) {
-    return state.selectedSymbol || "Waiting...";
-  }
-
-  const option = select.selectedOptions?.[0];
-
-  return option?.textContent?.trim() ||
-    state.selectedSymbol ||
-    "Waiting...";
-}
-
-
-function updateChosenPairDisplay() {
-  const marketName = getSelectedMarketName();
-  const tf = getSelectedTimeframe();
-
-  const display = `${marketName} — ${tf}`;
-
-  const possibleElements = [
-    "#chosenPair",
-    "#chosenPairDisplay",
-    "#selectedPair",
-    "#selectedMarket",
-    "#currentMarket",
-    "#marketName"
-  ];
-
-  let found = false;
-
-  possibleElements.forEach(selector => {
-    const el = $(selector);
-
-    if (el) {
-      el.textContent = display;
-      found = true;
-    }
-  });
-
-  /*
-    If the existing HTML has no chosen-pair element,
-    create one under the market selector.
-  */
-  if (!found) {
-    const market = $("#market");
-
-    if (market && market.parentElement) {
-      let el = $("#sniperChosenPair");
-
-      if (!el) {
-        el = document.createElement("div");
-        el.id = "sniperChosenPair";
-
-        el.style.fontWeight = "600";
-        el.style.marginTop = "8px";
-
-        market.parentElement.appendChild(el);
-      }
-
-      el.textContent = `Chosen Pair: ${display}`;
-    }
-  }
-
-  window.currentSymbol = state.selectedSymbol;
-  window.currentTimeframe = tf;
+  return (
+    Math.floor(now / duration) * duration
+  ) - duration;
 }
 
 
@@ -306,80 +332,147 @@ function updateChosenPairDisplay() {
    CONNECTION STATUS
    ============================================================ */
 
-function updateConnectionUI(connected) {
-  const dot = $(".status-dot");
-  const text = $("#connectionText");
+function setConnectionStatus(text, connected = false) {
 
-  if (dot) {
-    dot.classList.toggle("connected", connected);
-    dot.classList.toggle("disconnected", !connected);
-  }
+  setText(
+    "connectionText",
+    text
+  );
 
-  if (text) {
-    text.textContent = connected
-      ? "LIVE — Deriv Connected"
-      : "Connecting to Deriv...";
+  const element =
+    $("connectionText");
+
+  if (element) {
+
+    element.classList.toggle(
+      "connected",
+      connected
+    );
+
+    element.classList.toggle(
+      "disconnected",
+      !connected
+    );
   }
 }
 
 
 /* ============================================================
-   DERIV CONNECTION
+   DERIV WEBSOCKET
    ============================================================ */
 
 function connectDeriv() {
+
   if (
     state.ws &&
     (
-      state.ws.readyState === WebSocket.OPEN ||
-      state.ws.readyState === WebSocket.CONNECTING
+      state.ws.readyState ===
+      WebSocket.OPEN ||
+
+      state.ws.readyState ===
+      WebSocket.CONNECTING
     )
   ) {
     return;
   }
 
-  updateConnectionUI(false);
+  setConnectionStatus(
+    "Connecting...",
+    false
+  );
 
   try {
-    state.ws = new WebSocket(CONFIG.DERIV_WS);
+
+    state.ws =
+      new WebSocket(
+        CONFIG.DERIV_WS
+      );
+
   } catch (error) {
+
+    console.error(
+      "WebSocket creation error:",
+      error
+    );
+
     scheduleReconnect();
+
     return;
   }
 
-  state.ws.onopen = () => {
-    state.connected = true;
-    state.reconnectDelay = CONFIG.RECONNECT_MIN;
 
-    updateConnectionUI(true);
+  state.ws.onopen = () => {
+
+    console.log(
+      "Deriv WebSocket connected."
+    );
+
+    state.connected = true;
+
+    state.reconnectDelay =
+      CONFIG.RECONNECT_MIN;
+
+    setConnectionStatus(
+      "LIVE",
+      true
+    );
 
     requestActiveSymbols();
 
-    if (state.selectedSymbol) {
-      subscribeToTicks(state.selectedSymbol);
+    state.scannerGeneration++;
+
+    if (state.initialized) {
+
+      setTimeout(
+        () => {
+          startFullScanner();
+        },
+        1000
+      );
     }
   };
+
 
   state.ws.onmessage = event => {
+
     try {
-      const message = JSON.parse(event.data);
+
+      const message =
+        JSON.parse(event.data);
+
       handleDerivMessage(message);
+
     } catch (error) {
-      console.error("Deriv message error:", error);
+
+      console.error(
+        "Deriv message parse error:",
+        error
+      );
     }
   };
 
+
   state.ws.onerror = error => {
-    console.error("Deriv WebSocket error:", error);
+
+    console.error(
+      "Deriv WebSocket error:",
+      error
+    );
+
+    setConnectionStatus(
+      "Connection Error",
+      false
+    );
   };
 
+
   state.ws.onclose = () => {
+
     state.connected = false;
 
-    updateConnectionUI(false);
-
-    rejectPendingRequests(
-      new Error("Deriv connection closed.")
+    setConnectionStatus(
+      "Disconnected",
+      false
     );
 
     scheduleReconnect();
@@ -388,101 +481,181 @@ function connectDeriv() {
 
 
 function scheduleReconnect() {
-  if (state.reconnectTimer) return;
 
-  state.reconnectTimer = setTimeout(() => {
-    state.reconnectTimer = null;
-
-    connectDeriv();
-
-    state.reconnectDelay = Math.min(
-      state.reconnectDelay * 2,
-      CONFIG.RECONNECT_MAX
-    );
-  }, state.reconnectDelay);
-}
-
-
-function rejectPendingRequests(error) {
-  for (const [, pending] of state.pendingRequests) {
-    clearTimeout(pending.timeout);
-    pending.reject(error);
+  if (state.reconnectTimer) {
+    return;
   }
 
-  state.pendingRequests.clear();
+  const delay =
+    state.reconnectDelay;
+
+  state.reconnectTimer =
+    setTimeout(() => {
+
+      state.reconnectTimer = null;
+
+      connectDeriv();
+
+      state.reconnectDelay =
+        Math.min(
+          state.reconnectDelay * 2,
+          CONFIG.RECONNECT_MAX
+        );
+
+    }, delay);
 }
 
 
 /* ============================================================
-   DERIV REQUEST
+   REQUEST HANDLING
    ============================================================ */
 
-function sendRequest(payload, timeout = 15000) {
+function sendRequest(payload, timeout = 20000) {
+
   return new Promise((resolve, reject) => {
+
     if (
       !state.ws ||
-      state.ws.readyState !== WebSocket.OPEN
+      state.ws.readyState !==
+      WebSocket.OPEN
     ) {
-      reject(new Error("Deriv WebSocket is not connected."));
+
+      reject(
+        new Error(
+          "Deriv WebSocket is not connected."
+        )
+      );
+
       return;
     }
 
-    const reqId = state.requestId++;
 
-    const request = {
-      ...payload,
-      req_id: reqId
-    };
+    const reqId =
+      state.requestId++;
 
-    const timer = setTimeout(() => {
-      state.pendingRequests.delete(reqId);
-      reject(new Error("Deriv request timed out."));
-    }, timeout);
 
-    state.pendingRequests.set(reqId, {
-      resolve,
-      reject,
-      timeout
-    });
+    payload.req_id = reqId;
 
-    state.ws.send(JSON.stringify(request));
+
+    const timer =
+      setTimeout(() => {
+
+        state.pendingRequests.delete(
+          reqId
+        );
+
+        reject(
+          new Error(
+            "Deriv request timeout."
+          )
+        );
+
+      }, timeout);
+
+
+    state.pendingRequests.set(
+      reqId,
+      {
+        resolve,
+        reject,
+        timer
+      }
+    );
+
+
+    try {
+
+      state.ws.send(
+        JSON.stringify(payload)
+      );
+
+    } catch (error) {
+
+      clearTimeout(timer);
+
+      state.pendingRequests.delete(
+        reqId
+      );
+
+      reject(error);
+    }
   });
 }
 
 
-/* ============================================================
-   DERIV MESSAGE HANDLER
-   ============================================================ */
-
 function handleDerivMessage(message) {
-  if (message.req_id && state.pendingRequests.has(message.req_id)) {
-    const pending = state.pendingRequests.get(message.req_id);
 
-    clearTimeout(pending.timeout);
-    state.pendingRequests.delete(message.req_id);
+  if (
+    message.req_id &&
+    state.pendingRequests.has(
+      message.req_id
+    )
+  ) {
+
+    const pending =
+      state.pendingRequests.get(
+        message.req_id
+      );
+
+    clearTimeout(
+      pending.timer
+    );
+
+    state.pendingRequests.delete(
+      message.req_id
+    );
 
     if (message.error) {
+
       pending.reject(
         new Error(
           message.error.message ||
-          "Deriv request failed."
+          "Deriv API error."
         )
       );
+
     } else {
+
       pending.resolve(message);
     }
   }
 
+
   if (message.msg_type === "active_symbols") {
-    handleActiveSymbols(message);
+
+    handleActiveSymbols(
+      message.active_symbols || []
+    );
   }
+
 
   if (message.msg_type === "tick") {
-    handleTick(message);
+
+    handleTick(
+      message.tick
+    );
   }
 
-  if (message.msg_type === "candles") {
-    handleCandleResponse(message);
+
+  if (
+    message.msg_type ===
+    "history"
+  ) {
+
+    handleHistoryMessage(
+      message
+    );
+  }
+
+
+  if (
+    message.msg_type ===
+    "candles"
+  ) {
+
+    handleHistoryMessage(
+      message
+    );
   }
 }
 
@@ -491,54 +664,109 @@ function handleDerivMessage(message) {
    ACTIVE SYMBOLS
    ============================================================ */
 
-async function requestActiveSymbols() {
-  try {
-    const response = await sendRequest({
-      active_symbols: "full"
-    });
+function requestActiveSymbols() {
 
-    handleActiveSymbols(response);
-  } catch (error) {
-    console.error("Active symbols error:", error);
-  }
+  sendRequest({
+    active_symbols: "full",
+    product_type: "basic"
+  })
+    .then(response => {
+
+      handleActiveSymbols(
+        response.active_symbols || []
+      );
+
+    })
+    .catch(error => {
+
+      console.error(
+        "Active symbols error:",
+        error
+      );
+    });
 }
 
 
-function handleActiveSymbols(response) {
-  const raw = Array.isArray(response.active_symbols)
-    ? response.active_symbols
-    : [];
+function handleActiveSymbols(symbols) {
 
-  state.symbols = raw
-    .map(item => ({
-      symbol:
-        item.underlying_symbol ||
-        item.symbol ||
-        "",
+  const parsed = [];
 
-      name:
-        item.underlying_symbol_name ||
-        item.display_name ||
-        item.symbol ||
-        "",
+  for (
+    const item of symbols
+  ) {
 
-      type:
-        item.underlying_symbol_type ||
-        item.symbol_type ||
-        "Other"
-    }))
-    .filter(item => item.symbol);
+    const symbol =
+      item.underlying_symbol ||
+      item.symbol ||
+      "";
+
+    const name =
+      item.underlying_symbol_name ||
+      item.display_name ||
+      symbol;
+
+    const type =
+      item.underlying_symbol_type ||
+      item.symbol_type ||
+      "";
+
+
+    if (!symbol) continue;
+
+
+    parsed.push({
+      symbol,
+      name,
+      type,
+      raw: item
+    });
+  }
+
+
+  const unique =
+    new Map();
+
+
+  for (
+    const item of parsed
+  ) {
+
+    if (
+      !unique.has(
+        item.symbol
+      )
+    ) {
+
+      unique.set(
+        item.symbol,
+        item
+      );
+    }
+  }
+
+
+  state.symbols =
+    Array.from(
+      unique.values()
+    ).sort(
+      (a, b) =>
+        a.name.localeCompare(
+          b.name
+        )
+    );
+
 
   populateMarketSelector();
 
-  if (!state.selectedSymbol && state.symbols.length) {
-    const first =
-      state.symbols.find(
-        x => x.symbol === "frxXAUUSD"
-      ) ||
-      state.symbols[0];
 
-    selectMarket(first.symbol);
+  state.scannerGeneration++;
+
+  if (
+    state.initialized &&
+    CONFIG.SCANNER_ENABLED
+  ) {
+
+    startFullScanner();
   }
 }
 
@@ -548,58 +776,101 @@ function handleActiveSymbols(response) {
    ============================================================ */
 
 function populateMarketSelector() {
-  const select = $("#market");
+
+  const select =
+    $("market");
 
   if (!select) return;
 
-  const current = state.selectedSymbol;
+
+  const oldValue =
+    state.selectedSymbol ||
+    select.value;
+
 
   select.innerHTML = "";
 
-  const grouped = {};
 
-  state.symbols.forEach(item => {
-    let group = item.type || "Other";
+  for (
+    const market of state.symbols
+  ) {
 
-    if (!grouped[group]) {
-      grouped[group] = [];
-    }
+    const option =
+      document.createElement(
+        "option"
+      );
 
-    grouped[group].push(item);
-  });
+    option.value =
+      market.symbol;
 
-  Object.keys(grouped)
-    .sort()
-    .forEach(group => {
-      const optgroup = document.createElement("optgroup");
+    option.textContent =
+      market.name +
+      (
+        market.name !==
+        market.symbol
+          ? ` (${market.symbol})`
+          : ""
+      );
 
-      optgroup.label = group;
+    select.appendChild(
+      option
+    );
+  }
 
-      grouped[group]
-        .sort((a, b) =>
-          a.name.localeCompare(b.name)
-        )
-        .forEach(item => {
-          const option = document.createElement("option");
-
-          option.value = item.symbol;
-          option.textContent =
-            `${item.name} (${item.symbol})`;
-
-          optgroup.appendChild(option);
-        });
-
-      select.appendChild(optgroup);
-    });
 
   if (
-    current &&
+    oldValue &&
     state.symbols.some(
-      item => item.symbol === current
+      item =>
+        item.symbol ===
+        oldValue
     )
   ) {
-    select.value = current;
+
+    select.value =
+      oldValue;
+
+    state.selectedSymbol =
+      oldValue;
+
+  } else if (
+    state.symbols.length
+  ) {
+
+    state.selectedSymbol =
+      state.symbols[0].symbol;
+
+    select.value =
+      state.selectedSymbol;
   }
+
+
+  updateSelectedMarketDisplay();
+}
+
+
+function updateSelectedMarketDisplay() {
+
+  const market =
+    state.symbols.find(
+      item =>
+        item.symbol ===
+        state.selectedSymbol
+    );
+
+
+  if (!market) return;
+
+
+  setText(
+    "selectedMarket",
+    market.name
+  );
+
+  setText(
+    "marketName",
+    market.name
+  );
 }
 
 
@@ -608,290 +879,574 @@ function populateMarketSelector() {
    ============================================================ */
 
 async function selectMarket(symbol) {
+
   if (!symbol) return;
 
-  const generation = ++state.analysisGeneration;
 
-  state.selectedSymbol = symbol;
+  state.selectedSymbol =
+    symbol;
+
+  state.analysisGeneration++;
 
   state.activeSignal = null;
-  state.analysis = null;
+
   state.tradeState = null;
 
-  updateChosenPairDisplay();
+  state.analysis = null;
 
-  setWaitingState(
-    "LOADING",
-    `Loading ${symbol} ${getSelectedTimeframe()} data...`
+  updateSelectedMarketDisplay();
+
+
+  subscribeToTick(
+    symbol
   );
 
-  subscribeToTicks(symbol);
 
-  try {
-    await loadTimeframeHistory(
-      symbol,
-      getSelectedTimeframe(),
-      true
-    );
-
-    if (generation !== state.analysisGeneration) {
-      return;
-    }
-
-    await runPrecisionAnalysis(
-      true,
-      generation
-    );
-  } catch (error) {
-    console.error("Market load error:", error);
-
-    if (generation === state.analysisGeneration) {
-      setWaitingState(
-        "WAIT",
-        "Waiting for confirmed market data."
-      );
-    }
-  }
+  await runPrecisionAnalysis(
+    true
+  );
 }
 
 
 /* ============================================================
-   TICKS
+   TICK SUBSCRIPTION
    ============================================================ */
 
-function subscribeToTicks(symbol) {
+function subscribeToTick(symbol) {
+
   if (
-    !state.ws ||
-    state.ws.readyState !== WebSocket.OPEN ||
+    !state.connected ||
     !symbol
   ) {
     return;
   }
 
-  try {
-    state.ws.send(
-      JSON.stringify({
-        forget_all: "ticks"
-      })
-    );
-  } catch (_) {}
 
-  try {
-    state.ws.send(
-      JSON.stringify({
-        ticks: symbol,
-        subscribe: 1
-      })
-    );
-  } catch (error) {
-    console.error("Tick subscription error:", error);
-  }
+  sendRequest({
+    ticks: symbol,
+    subscribe: 1
+  })
+    .catch(error => {
+
+      console.error(
+        "Tick subscription error:",
+        error
+      );
+    });
 }
 
 
-function handleTick(message) {
-  const tick = message.tick;
+/* ============================================================
+   TICK HANDLING
+   ============================================================ */
+
+function handleTick(tick) {
 
   if (!tick) return;
 
-  const symbol = tick.symbol;
 
-  if (
-    state.selectedSymbol &&
-    symbol !== state.selectedSymbol
-  ) {
+  const symbol =
+    tick.symbol;
+
+  const quote =
+    toNumber(tick.quote);
+
+
+  if (!symbol || quote === null) {
     return;
   }
 
-  state.livePrice = Number(tick.quote);
 
-  updateLivePrice(state.livePrice);
+  if (
+    symbol ===
+    state.selectedSymbol
+  ) {
 
-  /*
-    IMPORTANT:
-    Live tick is displayed but NEVER used to confirm
-    a new BUY or SELL signal.
-  */
+    state.livePrice =
+      quote;
 
-  if (state.tradeState) {
-    updateTradeManagement(state.livePrice);
+    updateLivePrice(
+      quote
+    );
+
+    manageActiveTrade(
+      quote
+    );
   }
 }
 
 
 function updateLivePrice(price) {
-  if (!Number.isFinite(price)) return;
 
-  const elements = [
-    "#livePrice",
-    "#price",
-    "#currentPrice"
-  ];
+  setText(
+    "livePrice",
+    formatPrice(price)
+  );
 
-  elements.forEach(selector => {
-    const el = $(selector);
-
-    if (el) {
-      el.textContent = formatPrice(price);
-    }
-  });
-
-  window.currentPrice = price;
+  setText(
+    "price",
+    formatPrice(price)
+  );
 }
 
 
 /* ============================================================
-   HISTORY
+   HISTORY CACHE
    ============================================================ */
 
-function historyKey(symbol, timeframe) {
-  return `${symbol}::${timeframe}`;
+function historyCacheKey(
+  symbol,
+  timeframe
+) {
+
+  return (
+    `${symbol}::${normalizeTimeframe(timeframe)}`
+  );
 }
 
 
-async function loadTimeframeHistory(
+/* ============================================================
+   HISTORY MESSAGE
+   ============================================================ */
+
+function handleHistoryMessage(message) {
+
+  const reqId =
+    message.req_id;
+
+  if (!reqId) return;
+
+
+  const pending =
+    state.pendingHistory.get(
+      reqId
+    );
+
+  if (!pending) return;
+
+
+  state.pendingHistory.delete(
+    reqId
+  );
+
+
+  const candles =
+    parseHistoryResponse(
+      message
+    );
+
+
+  if (
+    candles.length
+  ) {
+
+    state.candles[
+      historyCacheKey(
+        pending.symbol,
+        pending.timeframe
+      )
+    ] = {
+      candles,
+      updatedAt:
+        Date.now()
+    };
+  }
+
+
+  pending.resolve(
+    candles
+  );
+}
+
+
+/* ============================================================
+   HISTORY PARSER
+   ============================================================ */
+
+function parseHistoryResponse(
+  response
+) {
+
+  const raw =
+    response.candles ||
+    response.history?.candles ||
+    [];
+
+
+  if (
+    Array.isArray(raw) &&
+    raw.length
+  ) {
+
+    return raw
+      .map(candle => ({
+        epoch:
+          Number(
+            candle.epoch
+          ),
+        open:
+          Number(
+            candle.open
+          ),
+        high:
+          Number(
+            candle.high
+          ),
+        low:
+          Number(
+            candle.low
+          ),
+        close:
+          Number(
+            candle.close
+          )
+      }))
+      .filter(
+        candle =>
+          Number.isFinite(
+            candle.epoch
+          ) &&
+          Number.isFinite(
+            candle.open
+          ) &&
+          Number.isFinite(
+            candle.high
+          ) &&
+          Number.isFinite(
+            candle.low
+          ) &&
+          Number.isFinite(
+            candle.close
+          )
+      )
+      .sort(
+        (a, b) =>
+          a.epoch -
+          b.epoch
+      );
+  }
+
+
+  const history =
+    response.history;
+
+
+  if (
+    history &&
+    Array.isArray(
+      history.times
+    )
+  ) {
+
+    const opens =
+      history.open || [];
+
+    const highs =
+      history.high || [];
+
+    const lows =
+      history.low || [];
+
+    const closes =
+      history.close || [];
+
+
+    return history.times
+      .map(
+        (time, index) => ({
+          epoch:
+            Number(time),
+
+          open:
+            Number(
+              opens[index]
+            ),
+
+          high:
+            Number(
+              highs[index]
+            ),
+
+          low:
+            Number(
+              lows[index]
+            ),
+
+          close:
+            Number(
+              closes[index]
+            )
+        })
+      )
+      .filter(
+        candle =>
+          Number.isFinite(
+            candle.epoch
+          ) &&
+          Number.isFinite(
+            candle.open
+          ) &&
+          Number.isFinite(
+            candle.high
+          ) &&
+          Number.isFinite(
+            candle.low
+          ) &&
+          Number.isFinite(
+            candle.close
+          )
+      )
+      .sort(
+        (a, b) =>
+          a.epoch -
+          b.epoch
+      );
+  }
+
+
+  return [];
+}
+
+
+/* ============================================================
+   LOAD EXACT TIMEFRAME HISTORY
+   ============================================================ */
+
+function loadTimeframeHistory(
   symbol,
   timeframe,
   force = false
 ) {
-  timeframe = normalizeTimeframe(timeframe);
 
-  if (!symbol || !timeframe) {
-    throw new Error("Invalid market or timeframe.");
-  }
+  const tf =
+    normalizeTimeframe(
+      timeframe
+    );
 
-  const key = historyKey(symbol, timeframe);
+  const key =
+    historyCacheKey(
+      symbol,
+      tf
+    );
 
-  const cached = state.candles[symbol]?.[timeframe];
+
+  const cached =
+    state.candles[key];
+
+
+  const expected =
+    getExpectedLatestClosedEpoch(
+      tf
+    );
+
 
   if (
     !force &&
     cached &&
-    cached.candles?.length >= 100
+    cached.candles &&
+    cached.candles.length >= 100
   ) {
-    return cached.candles;
-  }
 
-  /*
-    Prevent duplicate requests for the exact same
-    symbol/timeframe.
-  */
-  if (state.pendingHistory?.has(key)) {
-    return state.pendingHistory.get(key);
-  }
+    const latest =
+      cached.candles[
+        cached.candles.length - 1
+      ]?.epoch || 0;
 
-  if (!state.pendingHistory) {
-    state.pendingHistory = new Map();
-  }
 
-  const promise = (async () => {
-    const response = await sendRequest({
-      ticks_history: symbol,
+    if (
+      latest >= expected
+    ) {
 
-      style: "candles",
-
-      granularity:
-        CONFIG.TIMEFRAMES[timeframe],
-
-      count: CONFIG.HISTORY_COUNT,
-
-      end: "latest"
-    }, 20000);
-
-    const candles =
-      parseDerivCandles(response);
-
-    if (!candles.length) {
-      throw new Error(
-        `No ${timeframe} candles returned for ${symbol}.`
+      return Promise.resolve(
+        cached.candles
       );
     }
+  }
 
-    if (!state.candles[symbol]) {
-      state.candles[symbol] = {};
+
+  if (
+    state.pendingHistoryByKey &&
+    state.pendingHistoryByKey.has(key)
+  ) {
+
+    return state.pendingHistoryByKey.get(
+      key
+    );
+  }
+
+
+  if (
+    !state.pendingHistoryByKey
+  ) {
+
+    state.pendingHistoryByKey =
+      new Map();
+  }
+
+
+  const promise =
+    new Promise(
+      (resolve, reject) => {
+
+        if (
+          !state.connected
+        ) {
+
+          reject(
+            new Error(
+              "Not connected."
+            )
+          );
+
+          return;
+        }
+
+
+        const requestId =
+          state.requestId++;
+
+
+        state.pendingHistory.set(
+          requestId,
+          {
+            symbol,
+            timeframe: tf,
+            resolve,
+            reject
+          }
+        );
+
+
+        state.pendingHistoryByKey.set(
+          key,
+          promise
+        );
+
+
+        const timer =
+          setTimeout(() => {
+
+            if (
+              state.pendingHistory.has(
+                requestId
+              )
+            ) {
+
+              state.pendingHistory.delete(
+                requestId
+              );
+
+              state.pendingHistoryByKey.delete(
+                key
+              );
+
+              reject(
+                new Error(
+                  "History request timeout."
+                )
+              );
+            }
+
+          }, 20000);
+
+
+        try {
+
+          state.ws.send(
+            JSON.stringify({
+              ticks_history:
+                symbol,
+
+              adjust_start_time:
+                1,
+
+              count:
+                CONFIG.SCANNER_HISTORY_COUNT,
+
+              end:
+                "latest",
+
+              start:
+                1,
+
+              style:
+                "candles",
+
+              granularity:
+                getTimeframeSeconds(
+                  tf
+                ),
+
+              req_id:
+                requestId
+            })
+          );
+
+        } catch (error) {
+
+          clearTimeout(timer);
+
+          state.pendingHistory.delete(
+            requestId
+          );
+
+          state.pendingHistoryByKey.delete(
+            key
+          );
+
+          reject(error);
+        }
+      }
+    );
+
+
+  promise.finally(
+    () => {
+      state.pendingHistoryByKey.delete(
+        key
+      );
     }
-
-    state.candles[symbol][timeframe] = {
-      candles,
-      updatedAt: Date.now()
-    };
-
-    return candles;
-  })();
-
-  state.pendingHistory.set(key, promise);
-
-  try {
-    return await promise;
-  } finally {
-    state.pendingHistory.delete(key);
-  }
-}
+  );
 
 
-function parseDerivCandles(response) {
-  if (!Array.isArray(response?.candles)) {
-    return [];
-  }
-
-  return response.candles
-    .map(c => ({
-      epoch: Number(c.epoch),
-      open: Number(c.open),
-      high: Number(c.high),
-      low: Number(c.low),
-      close: Number(c.close)
-    }))
-    .filter(c =>
-      Number.isFinite(c.epoch) &&
-      Number.isFinite(c.open) &&
-      Number.isFinite(c.high) &&
-      Number.isFinite(c.low) &&
-      Number.isFinite(c.close)
-    )
-    .sort((a, b) => a.epoch - b.epoch);
-}
-
-
-function handleCandleResponse(message) {
-  /*
-    History requests are handled by sendRequest().
-    This function intentionally does not create signals.
-  */
+  return promise;
 }
 
 
 /* ============================================================
-   CLOSED CANDLES ONLY
+   CLOSED CANDLES
    ============================================================ */
 
 function getClosedCandles(
-  symbol,
+  candles,
   timeframe
 ) {
-  timeframe = normalizeTimeframe(timeframe);
 
-  const stored =
-    state.candles[symbol]?.[timeframe]?.candles;
+  if (
+    !Array.isArray(candles) ||
+    !candles.length
+  ) {
 
-  if (!stored?.length) {
     return [];
   }
 
+
   const duration =
-    CONFIG.TIMEFRAMES[timeframe];
+    getTimeframeSeconds(
+      timeframe
+    );
 
-  const now =
-    Math.floor(Date.now() / 1000);
 
-  /*
-    Candle is closed only when:
-    candle start + timeframe <= current time
-  */
+  const currentCandleStart =
+    Math.floor(
+      Date.now() / 1000 / duration
+    ) * duration;
 
-  return stored.filter(
+
+  return candles.filter(
     candle =>
-      candle.epoch + duration <= now
+      Number(candle.epoch) <
+      currentCandleStart
   );
 }
 
@@ -904,336 +1459,533 @@ function calculateATR(
   candles,
   length = CONFIG.ATR_LENGTH
 ) {
-  if (candles.length < length + 1) {
-    return 0;
+
+  if (
+    candles.length <
+    length + 1
+  ) {
+    return null;
   }
+
 
   const ranges = [];
 
+
   for (
-    let i = candles.length - length;
+    let i = 1;
     i < candles.length;
     i++
   ) {
-    const current = candles[i];
-    const previous = candles[i - 1];
 
-    if (!previous) continue;
+    const current =
+      candles[i];
 
-    const tr = Math.max(
-      current.high - current.low,
+    const previous =
+      candles[i - 1];
 
-      Math.abs(
-        current.high - previous.close
-      ),
 
-      Math.abs(
-        current.low - previous.close
-      )
+    const trueRange =
+      Math.max(
+        current.high -
+          current.low,
+
+        Math.abs(
+          current.high -
+          previous.close
+        ),
+
+        Math.abs(
+          current.low -
+          previous.close
+        )
+      );
+
+
+    ranges.push(
+      trueRange
     );
-
-    ranges.push(tr);
   }
 
-  if (!ranges.length) return 0;
+
+  if (
+    ranges.length <
+    length
+  ) {
+
+    return null;
+  }
+
+
+  const recent =
+    ranges.slice(
+      -length
+    );
+
 
   return (
-    ranges.reduce(
-      (sum, value) => sum + value,
+    recent.reduce(
+      (sum, value) =>
+        sum + value,
       0
-    ) / ranges.length
+    ) / recent.length
   );
 }
 
 
 /* ============================================================
-   EMA 9
+   EMA
    ============================================================ */
 
 function calculateEMA(
   candles,
   length = CONFIG.EMA_LENGTH
 ) {
-  if (candles.length < length) {
+
+  if (
+    candles.length <
+    length
+  ) {
     return null;
   }
+
+
+  const closes =
+    candles.map(
+      candle =>
+        Number(candle.close)
+    );
+
 
   const multiplier =
     2 / (length + 1);
 
-  let ema = candles
-    .slice(0, length)
-    .reduce(
-      (sum, candle) =>
-        sum + candle.close,
-      0
-    ) / length;
+
+  let ema =
+    closes
+      .slice(
+        0,
+        length
+      )
+      .reduce(
+        (sum, value) =>
+          sum + value,
+        0
+      ) / length;
+
 
   for (
     let i = length;
-    i < candles.length;
+    i < closes.length;
     i++
   ) {
+
     ema =
       (
-        candles[i].close - ema
+        closes[i] -
+        ema
       ) *
-        multiplier +
+      multiplier +
       ema;
   }
+
 
   return ema;
 }
 
 
 /* ============================================================
-   SIGNAL-LIB STYLE SWING ENGINE
-   DEPTH = 30
-   DEVIATION = 5
-   BACKSTEP = 5
-
-   Important:
-   A pivot is NOT usable until the required candles
-   AFTER it have closed.
-
-   Therefore no future information is used for
-   historical signals.
+   SWING DETECTION
+   DEPTH 30 / DEVIATION 5 / BACKSTEP 5
    ============================================================ */
 
-function detectSwings(candles) {
-  const swings = [];
+function detectSwings(
+  candles
+) {
 
-  const depth = CONFIG.DEPTH;
-  const backstep = CONFIG.BACKSTEP;
+  const depth =
+    CONFIG.DEPTH;
+
+  const deviation =
+    CONFIG.DEVIATION;
+
+  const backstep =
+    CONFIG.BACKSTEP;
+
+
+  const highs = [];
+
+  const lows = [];
+
 
   if (
     candles.length <
-    depth * 2 + 10
+    depth * 2 + 5
   ) {
-    return swings;
+
+    return {
+      highs,
+      lows
+    };
   }
+
 
   for (
     let i = depth;
     i < candles.length - depth;
     i++
   ) {
-    const candidate = candles[i];
 
-    const left =
-      candles.slice(
-        i - depth,
-        i
-      );
+    const current =
+      candles[i];
 
-    const right =
-      candles.slice(
-        i + 1,
-        i + depth + 1
-      );
 
-    const highestLeft =
-      Math.max(
-        ...left.map(c => c.high)
-      );
+    let isHigh = true;
 
-    const highestRight =
-      Math.max(
-        ...right.map(c => c.high)
-      );
+    let isLow = true;
 
-    const lowestLeft =
-      Math.min(
-        ...left.map(c => c.low)
-      );
 
-    const lowestRight =
-      Math.min(
-        ...right.map(c => c.low)
-      );
+    for (
+      let j = i - depth;
+      j <= i + depth;
+      j++
+    ) {
 
-    const avgRange =
-      getAverageRange(
-        candles,
-        Math.max(0, i - 50),
-        i
-      );
+      if (j === i) continue;
 
-    const deviationThreshold =
-      avgRange *
-      (CONFIG.DEVIATION / 5);
 
-    const isHigh =
-      candidate.high >= highestLeft &&
-      candidate.high >= highestRight &&
-      (
-        candidate.high -
-        Math.min(
-          lowestLeft,
-          lowestRight
-        )
-      ) >= deviationThreshold;
+      if (
+        candles[j].high >
+        current.high
+      ) {
 
-    const isLow =
-      candidate.low <= lowestLeft &&
-      candidate.low <= lowestRight &&
-      (
-        Math.max(
-          highestLeft,
-          highestRight
-        ) -
-        candidate.low
-      ) >= deviationThreshold;
+        isHigh = false;
+      }
+
+
+      if (
+        candles[j].low <
+        current.low
+      ) {
+
+        isLow = false;
+      }
+
+
+      if (
+        !isHigh &&
+        !isLow
+      ) {
+
+        break;
+      }
+    }
+
 
     if (isHigh) {
-      swings.push({
-        type: "HIGH",
-        price: candidate.high,
-        epoch: candidate.epoch,
+
+      highs.push({
         index: i,
-        confirmedAtIndex:
-          i + depth
+        epoch: current.epoch,
+        price: current.high,
+        type: "HIGH"
       });
     }
+
 
     if (isLow) {
-      swings.push({
-        type: "LOW",
-        price: candidate.low,
-        epoch: candidate.epoch,
+
+      lows.push({
         index: i,
-        confirmedAtIndex:
-          i + depth
+        epoch: current.epoch,
+        price: current.low,
+        type: "LOW"
       });
     }
   }
 
-  /*
-    BACKSTEP:
-    Remove nearby duplicate pivots.
-  */
 
-  const filtered = [];
+  /* ==========================================================
+     DEVIATION FILTER
+     ========================================================== */
 
-  for (const swing of swings) {
-    const previous =
-      [...filtered]
-        .reverse()
-        .find(
-          x =>
-            x.type === swing.type
-        );
+  const filteredHighs =
+    filterSwingsByDeviation(
+      highs,
+      deviation
+    );
 
-    if (!previous) {
-      filtered.push(swing);
-      continue;
-    }
 
-    if (
-      swing.index -
-      previous.index <
-      backstep
-    ) {
-      if (
-        swing.type === "HIGH" &&
-        swing.price > previous.price
-      ) {
-        filtered[
-          filtered.indexOf(previous)
-        ] = swing;
-      }
+  const filteredLows =
+    filterSwingsByDeviation(
+      lows,
+      deviation
+    );
 
-      if (
-        swing.type === "LOW" &&
-        swing.price < previous.price
-      ) {
-        filtered[
-          filtered.indexOf(previous)
-        ] = swing;
-      }
 
-      continue;
-    }
+  /* ==========================================================
+     BACKSTEP
+     ========================================================== */
 
-    filtered.push(swing);
-  }
+  return {
+    highs:
+      applyBackstep(
+        filteredHighs,
+        backstep,
+        true
+      ),
 
-  return filtered.sort(
-    (a, b) =>
-      a.index - b.index
-  );
+    lows:
+      applyBackstep(
+        filteredLows,
+        backstep,
+        false
+      )
+  };
 }
 
 
-function getAverageRange(
-  candles,
-  start,
-  end
+function filterSwingsByDeviation(
+  swings,
+  deviation
 ) {
-  const subset =
-    candles.slice(start, end);
 
-  if (!subset.length) {
-    return 0;
+  if (
+    swings.length <= 1
+  ) {
+
+    return swings;
   }
 
-  return (
-    subset.reduce(
-      (sum, candle) =>
-        sum +
-        (
-          candle.high -
-          candle.low
-        ),
-      0
-    ) / subset.length
-  );
+
+  const result = [
+    swings[0]
+  ];
+
+
+  for (
+    let i = 1;
+    i < swings.length;
+    i++
+  ) {
+
+    const previous =
+      result[
+        result.length - 1
+      ];
+
+    const current =
+      swings[i];
+
+
+    const distance =
+      Math.abs(
+        current.price -
+        previous.price
+      );
+
+
+    const minimum =
+      Math.abs(
+        previous.price
+      ) *
+      (
+        deviation /
+        10000
+      );
+
+
+    if (
+      distance >= minimum
+    ) {
+
+      result.push(
+        current
+      );
+
+    } else if (
+      current.index >
+      previous.index
+    ) {
+
+      if (
+        current.type ===
+        "HIGH" &&
+        current.price >
+        previous.price
+      ) {
+
+        result[
+          result.length - 1
+        ] = current;
+      }
+
+
+      if (
+        current.type ===
+        "LOW" &&
+        current.price <
+        previous.price
+      ) {
+
+        result[
+          result.length - 1
+        ] = current;
+      }
+    }
+  }
+
+
+  return result;
+}
+
+
+function applyBackstep(
+  swings,
+  backstep,
+  isHigh
+) {
+
+  if (
+    swings.length <= 1
+  ) {
+
+    return swings;
+  }
+
+
+  const result = [];
+
+
+  for (
+    const swing of swings
+  ) {
+
+    let replaced = false;
+
+
+    for (
+      let i = result.length - 1;
+      i >= 0;
+      i--
+    ) {
+
+      const previous =
+        result[i];
+
+
+      if (
+        swing.index -
+        previous.index >
+        backstep
+      ) {
+
+        break;
+      }
+
+
+      if (
+        isHigh &&
+        swing.price >=
+        previous.price
+      ) {
+
+        result[i] =
+          swing;
+
+        replaced = true;
+
+        break;
+      }
+
+
+      if (
+        !isHigh &&
+        swing.price <=
+        previous.price
+      ) {
+
+        result[i] =
+          swing;
+
+        replaced = true;
+
+        break;
+      }
+    }
+
+
+    if (!replaced) {
+
+      result.push(
+        swing
+      );
+    }
+  }
+
+
+  return result;
 }
 
 
 /* ============================================================
-   CONFIRMED SWINGS ONLY
+   USABLE SWINGS
    ============================================================ */
 
 function getUsableSwings(
-  candles,
-  swings
+  candles
 ) {
-  const lastClosedIndex =
+
+  const detected =
+    detectSwings(
+      candles
+    );
+
+
+  const lastIndex =
     candles.length - 1;
 
-  return swings.filter(
-    swing =>
-      swing.confirmedAtIndex <=
-      lastClosedIndex
-  );
+
+  return {
+    highs:
+      detected.highs.filter(
+        swing =>
+          swing.index <
+          lastIndex
+      ),
+
+    lows:
+      detected.lows.filter(
+        swing =>
+          swing.index <
+          lastIndex
+      )
+  };
 }
 
 
 /* ============================================================
-   DIRECTION
+   MARKET DIRECTION
    ============================================================ */
 
 function determineDirection(
   swings
 ) {
-  if (swings.length < 2) {
-    return {
-      direction: "WAIT",
-      reason:
-        "Waiting for a meaningful swing."
-    };
-  }
 
   const highs =
-    swings.filter(
-      s => s.type === "HIGH"
-    );
+    swings.highs;
 
   const lows =
-    swings.filter(
-      s => s.type === "LOW"
-    );
+    swings.lows;
+
+
+  if (
+    highs.length < 2 ||
+    lows.length < 2
+  ) {
+
+    return "NEUTRAL";
+  }
+
 
   const lastHigh =
     highs[highs.length - 1];
@@ -1241,74 +1993,37 @@ function determineDirection(
   const previousHigh =
     highs[highs.length - 2];
 
+
   const lastLow =
     lows[lows.length - 1];
 
   const previousLow =
     lows[lows.length - 2];
 
+
   if (
-    lastHigh &&
-    previousHigh &&
-    lastLow &&
-    previousLow
+    lastHigh.price >
+    previousHigh.price &&
+    lastLow.price >
+    previousLow.price
   ) {
-    const bullish =
-      lastHigh.price >
-        previousHigh.price &&
-      lastLow.price >
-        previousLow.price;
 
-    const bearish =
-      lastHigh.price <
-        previousHigh.price &&
-      lastLow.price <
-        previousLow.price;
-
-    if (bullish) {
-      return {
-        direction: "BUY",
-        reason:
-          "Bullish swing structure."
-      };
-    }
-
-    if (bearish) {
-      return {
-        direction: "SELL",
-        reason:
-          "Bearish swing structure."
-      };
-    }
+    return "BULLISH";
   }
 
-  /*
-    Also detect meaningful break of latest
-    confirmed swing.
-  */
 
-  const latest =
-    swings[swings.length - 1];
+  if (
+    lastHigh.price <
+    previousHigh.price &&
+    lastLow.price <
+    previousLow.price
+  ) {
 
-  if (latest) {
-    return {
-      direction:
-        latest.type === "LOW"
-          ? "BUY"
-          : "SELL",
-
-      reason:
-        latest.type === "LOW"
-          ? "Latest confirmed swing low supports bullish direction."
-          : "Latest confirmed swing high supports bearish direction."
-    };
+    return "BEARISH";
   }
 
-  return {
-    direction: "WAIT",
-    reason:
-      "Direction is unclear."
-  };
+
+  return "NEUTRAL";
 }
 
 
@@ -1316,67 +2031,60 @@ function determineDirection(
    SUPPORT / RESISTANCE
    ============================================================ */
 
-function findSupport(
+function findSupportResistance(
   candles,
-  swings,
-  price
+  swings
 ) {
-  const lows =
-    swings
+
+  const price =
+    candles[
+      candles.length - 1
+    ].close;
+
+
+  const supports =
+    swings.lows
       .filter(
-        s =>
-          s.type === "LOW" &&
-          s.price <= price
+        swing =>
+          swing.price <=
+          price
       )
       .sort(
         (a, b) =>
-          b.price - a.price
+          Math.abs(
+            price - a.price
+          ) -
+          Math.abs(
+            price - b.price
+          )
       );
 
-  return lows[0] || null;
-}
 
-
-function findResistance(
-  candles,
-  swings,
-  price
-) {
-  const highs =
-    swings
+  const resistances =
+    swings.highs
       .filter(
-        s =>
-          s.type === "HIGH" &&
-          s.price >= price
+        swing =>
+          swing.price >=
+          price
       )
       .sort(
         (a, b) =>
-          a.price - b.price
+          Math.abs(
+            price - a.price
+          ) -
+          Math.abs(
+            price - b.price
+          )
       );
 
-  return highs[0] || null;
-}
 
+  return {
+    support:
+      supports[0] || null,
 
-function isNearLevel(
-  price,
-  level,
-  atr
-) {
-  if (!level) return false;
-
-  const distance =
-    Math.abs(
-      price - level
-    );
-
-  const tolerance =
-    Math.max(
-      atr * 0.75,
-      Math.abs(price) * 0.001
-    );
-
-  return distance <= tolerance;
+    resistance:
+      resistances[0] || null
+  };
 }
 
 
@@ -1384,205 +2092,204 @@ function isNearLevel(
    CANDLE CONFIRMATION
    ============================================================ */
 
-function bullishCandle(candle) {
-  if (!candle) return false;
+function candleConfirmation(
+  candles
+) {
 
-  const body =
-    candle.close -
-    candle.open;
+  if (
+    candles.length < 3
+  ) {
 
-  const range =
-    candle.high -
-    candle.low;
-
-  if (range <= 0) return false;
-
-  const bodyRatio =
-    Math.abs(body) / range;
-
-  return (
-    body > 0 &&
-    bodyRatio >= 0.45
-  );
-}
+    return {
+      bullish: false,
+      bearish: false,
+      pattern: "WAIT",
+      rejection: false,
+      momentum: false
+    };
+  }
 
 
-function bearishCandle(candle) {
-  if (!candle) return false;
+  const current =
+    candles[
+      candles.length - 1
+    ];
 
-  const body =
-    candle.open -
-    candle.close;
-
-  const range =
-    candle.high -
-    candle.low;
-
-  if (range <= 0) return false;
-
-  const bodyRatio =
-    Math.abs(body) / range;
-
-  return (
-    body > 0 &&
-    bodyRatio >= 0.45
-  );
-}
+  const previous =
+    candles[
+      candles.length - 2
+    ];
 
 
-function bullishRejection(candle) {
-  if (!candle) return false;
-
-  const body =
+  const currentBody =
     Math.abs(
-      candle.close -
-      candle.open
+      current.close -
+      current.open
     );
+
+
+  const currentRange =
+    current.high -
+    current.low;
+
+
+  const upperWick =
+    current.high -
+    Math.max(
+      current.open,
+      current.close
+    );
+
 
   const lowerWick =
     Math.min(
-      candle.open,
-      candle.close
+      current.open,
+      current.close
     ) -
-    candle.low;
-
-  return (
-    lowerWick > body * 1.2 &&
-    candle.close >
-      candle.open
-  );
-}
+    current.low;
 
 
-function bearishRejection(candle) {
-  if (!candle) return false;
+  const bullishBody =
+    current.close >
+    current.open;
 
-  const body =
-    Math.abs(
-      candle.close -
-      candle.open
-    );
 
-  const upperWick =
-    candle.high -
-    Math.max(
-      candle.open,
-      candle.close
-    );
+  const bearishBody =
+    current.close <
+    current.open;
 
-  return (
-    upperWick > body * 1.2 &&
-    candle.close <
-      candle.open
-  );
+
+  const strongBody =
+    currentRange > 0 &&
+    currentBody /
+      currentRange >=
+      0.55;
+
+
+  const bullishRejection =
+    lowerWick >
+      currentBody * 1.2 &&
+    current.close >
+      current.open;
+
+
+  const bearishRejection =
+    upperWick >
+      currentBody * 1.2 &&
+    current.close <
+      current.open;
+
+
+  const bullishMomentum =
+    bullishBody &&
+    strongBody &&
+    current.close >
+      previous.high;
+
+
+  const bearishMomentum =
+    bearishBody &&
+    strongBody &&
+    current.close <
+      previous.low;
+
+
+  let pattern =
+    "NEUTRAL";
+
+
+  if (
+    bullishMomentum
+  ) {
+
+    pattern =
+      "BULLISH MOMENTUM";
+
+  } else if (
+    bearishMomentum
+  ) {
+
+    pattern =
+      "BEARISH MOMENTUM";
+
+  } else if (
+    bullishRejection
+  ) {
+
+    pattern =
+      "BULLISH REJECTION";
+
+  } else if (
+    bearishRejection
+  ) {
+
+    pattern =
+      "BEARISH REJECTION";
+  }
+
+
+  return {
+
+    bullish:
+      bullishMomentum ||
+      bullishRejection,
+
+    bearish:
+      bearishMomentum ||
+      bearishRejection,
+
+    pattern,
+
+    rejection:
+      bullishRejection ||
+      bearishRejection,
+
+    momentum:
+      bullishMomentum ||
+      bearishMomentum
+  };
 }
 
 
 /* ============================================================
-   SIMPLE CONFIRMATION
+   PRICE PROXIMITY
    ============================================================ */
 
-function getConfirmation(
-  candles,
-  direction,
-  support,
-  resistance,
-  ema
+function isNearLevel(
+  price,
+  level,
+  atr
 ) {
-  const last =
-    candles[candles.length - 1];
 
-  if (!last) {
-    return {
-      confirmed: false,
-      reason:
-        "No closed candle available."
-    };
+  if (
+    price === null ||
+    level === null
+  ) {
+
+    return false;
   }
 
-  if (direction === "BUY") {
-    const candleOK =
-      bullishCandle(last) ||
-      bullishRejection(last);
 
-    const emaOK =
-      ema !== null &&
-      last.close >= ema;
+  const distance =
+    Math.abs(
+      price - level
+    );
 
-    const supportOK =
-      !!support &&
-      (
-        isNearLevel(
-          last.close,
-          support.price,
-          calculateATR(candles)
-        ) ||
-        last.low <= support.price
-      );
 
-    return {
-      confirmed:
-        candleOK &&
-        emaOK &&
-        supportOK,
+  const tolerance =
+    atr
+      ? Math.max(
+          atr * 0.75,
+          price *
+            0.001
+        )
+      : price * 0.0015;
 
-      candleOK,
-      emaOK,
-      levelOK: supportOK,
 
-      reason:
-        candleOK &&
-        emaOK &&
-        supportOK
-          ? "Bullish swing + support + bullish candle + EMA 9."
-          : "Waiting for bullish candle, support, and EMA 9 confirmation."
-    };
-  }
-
-  if (direction === "SELL") {
-    const candleOK =
-      bearishCandle(last) ||
-      bearishRejection(last);
-
-    const emaOK =
-      ema !== null &&
-      last.close <= ema;
-
-    const resistanceOK =
-      !!resistance &&
-      (
-        isNearLevel(
-          last.close,
-          resistance.price,
-          calculateATR(candles)
-        ) ||
-        last.high >= resistance.price
-      );
-
-    return {
-      confirmed:
-        candleOK &&
-        emaOK &&
-        resistanceOK,
-
-      candleOK,
-      emaOK,
-      levelOK: resistanceOK,
-
-      reason:
-        candleOK &&
-        emaOK &&
-        resistanceOK
-          ? "Bearish swing + resistance + bearish candle + EMA 9."
-          : "Waiting for bearish candle, resistance, and EMA 9 confirmation."
-    };
-  }
-
-  return {
-    confirmed: false,
-    reason:
-      "Waiting for clear direction."
-  };
+  return (
+    distance <=
+    tolerance
+  );
 }
 
 
@@ -1593,102 +2300,192 @@ function getConfirmation(
 function calculateTradeLevels(
   direction,
   entry,
-  swing,
+  swings,
   atr
 ) {
+
+  let stop = null;
+
+
   if (
-    !Number.isFinite(entry) ||
-    !swing
+    direction ===
+    "BUY"
   ) {
-    return null;
-  }
 
-  let sl;
+    const lows =
+      swings.lows;
 
-  if (direction === "BUY") {
-    sl =
-      swing.price -
-      Math.max(
+
+    if (lows.length) {
+
+      stop =
+        lows[
+          lows.length - 1
+        ].price;
+    }
+
+
+    if (
+      stop === null ||
+      stop >= entry
+    ) {
+
+      stop =
+        entry -
+        (
+          atr ||
+          entry * 0.002
+        );
+    }
+
+
+    if (
+      atr &&
+      entry - stop <
         atr *
-          CONFIG.ATR_SAFETY_MULTIPLIER,
-        0
-      );
+          CONFIG.ATR_SAFETY_MULTIPLIER
+    ) {
 
-    if (sl >= entry) {
-      return null;
+      stop =
+        entry -
+        atr *
+          CONFIG.ATR_SAFETY_MULTIPLIER;
+    }
+
+  } else {
+
+    const highs =
+      swings.highs;
+
+
+    if (highs.length) {
+
+      stop =
+        highs[
+          highs.length - 1
+        ].price;
+    }
+
+
+    if (
+      stop === null ||
+      stop <= entry
+    ) {
+
+      stop =
+        entry +
+        (
+          atr ||
+          entry * 0.002
+        );
+    }
+
+
+    if (
+      atr &&
+      stop - entry <
+        atr *
+          CONFIG.ATR_SAFETY_MULTIPLIER
+    ) {
+
+      stop =
+        entry +
+        atr *
+          CONFIG.ATR_SAFETY_MULTIPLIER;
     }
   }
 
-  if (direction === "SELL") {
-    sl =
-      swing.price +
-      Math.max(
-        atr *
-          CONFIG.ATR_SAFETY_MULTIPLIER,
-        0
-      );
 
-    if (sl <= entry) {
-      return null;
-    }
-  }
+  stop =
+    roundPrice(stop);
+
 
   const risk =
     Math.abs(
-      entry - sl
+      entry - stop
     );
 
+
   if (
-    !Number.isFinite(risk) ||
-    risk <= 0
+    !risk ||
+    !Number.isFinite(risk)
   ) {
+
     return null;
   }
+
 
   let tp1;
   let tp2;
   let tp3;
 
-  if (direction === "BUY") {
+
+  if (
+    direction ===
+    "BUY"
+  ) {
+
     tp1 =
       entry +
-      risk * CONFIG.TP1_RR;
+      risk *
+      CONFIG.TP1_RR;
 
     tp2 =
       entry +
-      risk * CONFIG.TP2_RR;
+      risk *
+      CONFIG.TP2_RR;
 
     tp3 =
       entry +
-      risk * CONFIG.TP3_RR;
+      risk *
+      CONFIG.TP3_RR;
+
   } else {
+
     tp1 =
       entry -
-      risk * CONFIG.TP1_RR;
+      risk *
+      CONFIG.TP1_RR;
 
     tp2 =
       entry -
-      risk * CONFIG.TP2_RR;
+      risk *
+      CONFIG.TP2_RR;
 
     tp3 =
       entry -
-      risk * CONFIG.TP3_RR;
+      risk *
+      CONFIG.TP3_RR;
   }
 
+
   return {
-    entry,
-    sl,
-    tp1,
-    tp2,
-    tp3,
+
+    entry:
+      roundPrice(entry),
+
+    sl:
+      roundPrice(stop),
+
+    tp1:
+      roundPrice(tp1),
+
+    tp2:
+      roundPrice(tp2),
+
+    tp3:
+      roundPrice(tp3),
+
     risk,
-    rr: "1:3"
+
+    rr:
+      "1:3"
   };
 }
 
 
 /* ============================================================
-   SIGNAL GENERATION
+   MAIN SNIPER SIGNAL ENGINE
    ============================================================ */
 
 function generateSniperSignal(
@@ -1696,205 +2493,252 @@ function generateSniperSignal(
   timeframe,
   candles
 ) {
-  /*
-    CRITICAL:
-    This function receives CLOSED candles only.
-  */
+
+  const tf =
+    normalizeTimeframe(
+      timeframe
+    );
+
+
+  const closed =
+    getClosedCandles(
+      candles,
+      tf
+    );
+
 
   if (
-    !symbol ||
-    !timeframe ||
-    candles.length < 100
+    closed.length < 100
   ) {
+
     return {
       status: "WAIT",
-      timeframe,
       symbol,
+      timeframe: tf,
       reason:
-        "Waiting for enough closed candles."
+        "Not enough closed candles."
     };
   }
+
+
+  const last =
+    closed[
+      closed.length - 1
+    ];
+
 
   const swings =
     getUsableSwings(
-      candles,
-      detectSwings(candles)
+      closed
     );
 
-  if (swings.length < 2) {
-    return {
-      status: "WAIT",
-      timeframe,
-      symbol,
-      reason:
-        "Waiting for a confirmed swing."
-    };
-  }
-
-  const directionInfo =
-    determineDirection(swings);
-
-  if (
-    directionInfo.direction ===
-    "WAIT"
-  ) {
-    return {
-      status: "WAIT",
-      timeframe,
-      symbol,
-      reason:
-        "Waiting for a meaningful change in direction."
-    };
-  }
 
   const direction =
-    directionInfo.direction;
+    determineDirection(
+      swings
+    );
 
-  const last =
-    candles[candles.length - 1];
+
+  const sr =
+    findSupportResistance(
+      closed,
+      swings
+    );
+
+
+  const candle =
+    candleConfirmation(
+      closed
+    );
+
+
+  const ema9 =
+    calculateEMA(
+      closed,
+      CONFIG.EMA_LENGTH
+    );
+
 
   const atr =
-    calculateATR(candles);
-
-  const ema =
-    calculateEMA(candles);
-
-  const support =
-    findSupport(
-      candles,
-      swings,
-      last.close
+    calculateATR(
+      closed,
+      CONFIG.ATR_LENGTH
     );
 
-  const resistance =
-    findResistance(
-      candles,
-      swings,
-      last.close
-    );
 
-  const confirmation =
-    getConfirmation(
-      candles,
-      direction,
-      support,
-      resistance,
-      ema
-    );
-
-  /*
-    Confirmation is mandatory.
-    No forced BUY/SELL.
-  */
-
-  if (!confirmation.confirmed) {
-    return {
-      status: "WAIT",
-
-      symbol,
-      timeframe,
-
-      direction,
-
-      price: last.close,
-
-      swings,
-
-      ema,
-
-      atr,
-
-      support,
-      resistance,
-
-      confirmation,
-
-      reason:
-        confirmation.reason
-    };
-  }
-
-  /*
-    Important:
-    Use the most recent appropriate
-    CONFIRMED swing for SL.
-  */
-
-  const swing =
-    direction === "BUY"
-      ? [...swings]
-          .reverse()
-          .find(
-            s => s.type === "LOW"
-          )
-      : [...swings]
-          .reverse()
-          .find(
-            s => s.type === "HIGH"
-          );
-
-  if (!swing) {
-    return {
-      status: "WAIT",
-
-      symbol,
-      timeframe,
-
-      direction,
-
-      reason:
-        "Waiting for an important confirmed swing for stop loss."
-    };
-  }
-
-  /*
-    ENTRY IS FROZEN HERE.
-    It is the CLOSED candle's confirmed close.
-  */
-
-  const entry =
+  const price =
     Number(last.close);
+
+
+  const nearSupport =
+    sr.support
+      ? isNearLevel(
+          price,
+          sr.support.price,
+          atr
+        )
+      : false;
+
+
+  const nearResistance =
+    sr.resistance
+      ? isNearLevel(
+          price,
+          sr.resistance.price,
+          atr
+        )
+      : false;
+
+
+  const emaBullish =
+    ema9 !== null &&
+    price >= ema9;
+
+
+  const emaBearish =
+    ema9 !== null &&
+    price <= ema9;
+
+
+  const bullish =
+    direction ===
+      "BULLISH" &&
+
+    nearSupport &&
+
+    candle.bullish &&
+
+    emaBullish;
+
+
+  const bearish =
+    direction ===
+      "BEARISH" &&
+
+    nearResistance &&
+
+    candle.bearish &&
+
+    emaBearish;
+
+
+  if (
+    !bullish &&
+    !bearish
+  ) {
+
+    return {
+
+      status:
+        "WAIT",
+
+      symbol,
+
+      timeframe: tf,
+
+      candleTime:
+        last.epoch,
+
+      direction,
+
+      entry:
+        roundPrice(price),
+
+      ema9:
+        roundPrice(ema9),
+
+      atr:
+        roundPrice(atr),
+
+      support:
+        sr.support?.price
+          ? roundPrice(
+              sr.support.price
+            )
+          : null,
+
+      resistance:
+        sr.resistance?.price
+          ? roundPrice(
+              sr.resistance.price
+            )
+          : null,
+
+      pattern:
+        candle.pattern,
+
+      reason:
+        buildWaitReason({
+          direction,
+          nearSupport,
+          nearResistance,
+          candle,
+          emaBullish,
+          emaBearish
+        })
+    };
+  }
+
+
+  const signalDirection =
+    bullish
+      ? "BUY"
+      : "SELL";
+
 
   const levels =
     calculateTradeLevels(
-      direction,
-      entry,
-      swing,
+      signalDirection,
+      price,
+      swings,
       atr
     );
 
+
   if (!levels) {
+
     return {
-      status: "WAIT",
+
+      status:
+        "WAIT",
 
       symbol,
-      timeframe,
 
-      direction,
+      timeframe: tf,
+
+      candleTime:
+        last.epoch,
 
       reason:
-        "Invalid risk structure. Waiting for a cleaner setup."
+        "Unable to calculate safe trade levels."
     };
   }
 
-  /*
-    Create immutable signal.
-  */
 
-  const signal = {
-    id:
-      `${symbol}_${timeframe}_${last.epoch}_${direction}`,
+  const reason =
+    bullish
+
+      ? "Bullish swing + support + bullish candle + EMA9 confirmation."
+
+      : "Bearish swing + resistance + bearish candle + EMA9 confirmation.";
+
+
+  return {
+
+    status:
+      "SIGNAL",
+
+    signal:
+      signalDirection,
+
+    direction:
+      signalDirection,
 
     symbol,
-    timeframe,
-    direction,
 
-    status: "SNIPER",
+    timeframe: tf,
 
-    confirmedAt:
-      last.epoch,
-
-    confirmedCandle:
+    candleTime:
       last.epoch,
 
     entry:
@@ -1912,47 +2756,124 @@ function generateSniperSignal(
     tp3:
       levels.tp3,
 
-    risk:
-      levels.risk,
-
     rr:
       levels.rr,
 
-    ema,
+    risk:
+      levels.risk,
 
-    atr,
+    ema9:
+      roundPrice(ema9),
 
-    swing: {
-      type: swing.type,
-      price: swing.price,
-      epoch: swing.epoch
-    },
+    atr:
+      roundPrice(atr),
 
     support:
-      support
-        ? {
-            price: support.price,
-            epoch: support.epoch
-          }
+      sr.support?.price
+        ? roundPrice(
+            sr.support.price
+          )
         : null,
 
     resistance:
-      resistance
-        ? {
-            price: resistance.price,
-            epoch: resistance.epoch
-          }
+      sr.resistance?.price
+        ? roundPrice(
+            sr.resistance.price
+          )
         : null,
 
-    reason:
-      direction === "BUY"
-        ? "Bullish swing + support + bullish candle + EMA 9."
-        : "Bearish swing + resistance + bearish candle + EMA 9.",
+    pattern:
+      candle.pattern,
 
-    frozen: true
+    rejection:
+      candle.rejection,
+
+    momentum:
+      candle.momentum,
+
+    reason
   };
+}
 
-  return signal;
+
+/* ============================================================
+   WAIT REASON
+   ============================================================ */
+
+function buildWaitReason(
+  data
+) {
+
+  if (
+    data.direction ===
+    "NEUTRAL"
+  ) {
+
+    return "No clear bullish or bearish swing direction.";
+  }
+
+
+  if (
+    data.direction ===
+    "BULLISH"
+  ) {
+
+    if (
+      !data.nearSupport
+    ) {
+
+      return "Bullish structure detected, but price is not near confirmed support.";
+    }
+
+
+    if (
+      !data.candle.bullish
+    ) {
+
+      return "Waiting for bullish candle confirmation.";
+    }
+
+
+    if (
+      !data.emaBullish
+    ) {
+
+      return "Waiting for EMA9 bullish confirmation.";
+    }
+  }
+
+
+  if (
+    data.direction ===
+    "BEARISH"
+  ) {
+
+    if (
+      !data.nearResistance
+    ) {
+
+      return "Bearish structure detected, but price is not near confirmed resistance.";
+    }
+
+
+    if (
+      !data.candle.bearish
+    ) {
+
+      return "Waiting for bearish candle confirmation.";
+    }
+
+
+    if (
+      !data.emaBearish
+    ) {
+
+      return "Waiting for EMA9 bearish confirmation.";
+    }
+  }
+
+
+  return "Waiting for complete sniper confirmation.";
 }
 
 
@@ -1960,535 +2881,771 @@ function generateSniperSignal(
    SIGNAL KEY
    ============================================================ */
 
-function signalKey(signal) {
+function signalKey(
+  signal
+) {
+
   if (!signal) return "";
+
 
   return [
     signal.symbol,
     signal.timeframe,
-    signal.direction,
-    signal.confirmedCandle
-  ].join("_");
+    signal.signal ||
+      signal.direction,
+    signal.candleTime
+  ].join("::");
 }
 
 
 /* ============================================================
-   PROCESS CONFIRMED SIGNAL
+   BACKGROUND SCANNER KEY
    ============================================================ */
 
-function processSignal(signal) {
-  /*
-    NEVER allow another timeframe to overwrite
-    the selected timeframe.
-  */
+function scannerContextKey(
+  symbol,
+  timeframe
+) {
+
+  return (
+    `${symbol}::${normalizeTimeframe(timeframe)}`
+  );
+}
+
+
+/* ============================================================
+   SCANNER SIGNAL KEY
+   ============================================================ */
+
+function scannerSignalKey(
+  signal
+) {
+
+  return signalKey(
+    signal
+  );
+}
+
+
+/* ============================================================
+   CHECK WHETHER SIGNAL IS NEW
+   ============================================================ */
+
+function isNewScannerSignal(
+  signal
+) {
+
+  const key =
+    scannerSignalKey(
+      signal
+    );
+
+
+  if (
+    !key
+  ) {
+    return false;
+  }
+
+
+  if (
+    state.scannerSeenSignals.has(
+      key
+    )
+  ) {
+
+    return false;
+  }
+
+
+  state.scannerSeenSignals.add(
+    key
+  );
+
+
+  return true;
+}
+
+
+/* ============================================================
+   CENTRAL SIGNAL PROCESSOR
+   ============================================================ */
+
+function processSignal(
+  signal,
+  options = {}
+) {
 
   if (
     !signal ||
-    signal.status !== "SNIPER"
+    signal.status !==
+    "SIGNAL"
   ) {
+
     return;
   }
 
-  if (
-    signal.symbol !==
-    state.selectedSymbol
-  ) {
-    return;
-  }
 
-  if (
-    signal.timeframe !==
-    getSelectedTimeframe()
-  ) {
-    return;
-  }
-
-  /*
-    Same confirmed candle:
-    never replace it.
-  */
-
-  if (
-    state.activeSignal &&
-    state.activeSignal.id ===
-      signal.id
-  ) {
-    return;
-  }
-
-  /*
-    Opposite signal on a later CLOSED candle
-    is a new signal, not a modification of
-    the old signal.
-  */
-
-  state.activeSignal =
-    deepFreezeSignal(signal);
-
-  state.tradeState = {
-    signal:
-      state.activeSignal,
-
-    tp1Hit: false,
-    tp2Hit: false,
-    tp3Hit: false,
-    stopHit: false,
-    breakEvenMoved: false,
-
-    currentSL:
-      signal.sl
-  };
-
-  state.signalHistory.unshift(
-    state.activeSignal
-  );
-
-  state.signalHistory =
-    state.signalHistory.slice(
-      0,
-      100
+  const key =
+    signalKey(
+      signal
     );
 
-  updateDashboard(
-    state.activeSignal
-  );
+
+  if (!key) return;
+
+
+  const alreadyNotified =
+    state.notifiedSignals.has(
+      key
+    );
+
+
+  if (
+    !alreadyNotified &&
+    options.notify !== false
+  ) {
+
+    state.notifiedSignals.add(
+      key
+    );
+
+    sendSignalAlert(
+      signal
+    );
+  }
+
 
   addSignalToHistory(
-    state.activeSignal
+    signal
   );
 
-  sendSignalAlert(
-    state.activeSignal
-  );
-}
 
+  if (
+    signal.symbol ===
+    state.selectedSymbol &&
+    signal.timeframe ===
+    state.selectedTimeframe
+  ) {
 
-function deepFreezeSignal(signal) {
-  /*
-    Clone first so the original object
-    cannot be accidentally modified.
-  */
+    state.activeSignal =
+      signal;
 
-  const clone =
-    JSON.parse(
-      JSON.stringify(signal)
-    );
+    state.tradeState = {
 
-  return Object.freeze(clone);
+      signal,
+
+      tp1Hit: false,
+
+      tp2Hit: false,
+
+      tp3Hit: false,
+
+      stopped: false,
+
+      breakeven: false,
+
+      currentSL:
+        signal.sl
+    };
+  }
 }
 
 
 /* ============================================================
-   TRADE MANAGEMENT
+   BACKGROUND SIGNAL ALERT
    ============================================================ */
 
-function updateTradeManagement(
-  price
+function sendBackgroundSignalAlert(
+  signal
 ) {
-  const trade =
-    state.tradeState;
+
+  const key =
+    scannerSignalKey(
+      signal
+    );
+
 
   if (
-    !trade ||
-    !trade.signal ||
-    trade.stopHit
+    state.scannerNotifiedSignals.has(
+      key
+    )
+  ) {
+
+    return;
+  }
+
+
+  state.scannerNotifiedSignals.add(
+    key
+  );
+
+
+  if (
+    !state.notifiedSignals.has(
+      key
+    )
+  ) {
+
+    state.notifiedSignals.add(
+      key
+    );
+
+    sendSignalAlert(
+      signal
+    );
+  }
+
+
+  addSignalToHistory(
+    signal
+  );
+
+
+  state.scannerSignals[
+    scannerContextKey(
+      signal.symbol,
+      signal.timeframe
+    )
+  ] = signal;
+}
+
+
+/* ============================================================
+   BUILD SIGNAL MESSAGE
+   ============================================================ */
+
+function buildSignalMessage(
+  signal
+) {
+
+  const direction =
+    signal.signal ||
+    signal.direction;
+
+
+  const icon =
+    direction === "BUY"
+      ? "🟢"
+      : "🔴";
+
+
+  const action =
+    direction === "BUY"
+      ? "SNIPER BUY"
+      : "SNIPER SELL";
+
+
+  return (
+`${icon} PRECISION ${action}
+
+Market: ${signal.symbol}
+Timeframe: ${signal.timeframe}
+
+Entry: ${formatPrice(signal.entry)}
+SL: ${formatPrice(signal.sl)}
+TP1: ${formatPrice(signal.tp1)}
+TP2: ${formatPrice(signal.tp2)}
+TP3: ${formatPrice(signal.tp3)}
+
+RR: 1:3
+
+Reason:
+${signal.reason}`
+  );
+}
+
+
+/* ============================================================
+   BROWSER / IN-APP ALERT
+   ============================================================ */
+
+function sendSignalAlert(
+  signal
+) {
+
+  if (
+    !state.alertsEnabled
   ) {
     return;
   }
 
-  const signal =
-    trade.signal;
 
-  /*
-    BUY
-  */
-
-  if (signal.direction === "BUY") {
-    if (
-      !trade.tp1Hit &&
-      price >= signal.tp1
-    ) {
-      trade.tp1Hit = true;
-
-      /*
-        Move SL toward BE only forward.
-      */
-
-      if (
-        trade.currentSL <
-        signal.entry
-      ) {
-        trade.currentSL =
-          signal.entry;
-
-        trade.breakEvenMoved =
-          true;
-      }
-
-      showTradeEvent(
-        "TP1 HIT ✅",
-        "Break Even protection activated when appropriate."
-      );
-    }
-
-    if (
-      !trade.tp2Hit &&
-      price >= signal.tp2
-    ) {
-      trade.tp2Hit = true;
-
-      showTradeEvent(
-        "TP2 HIT ✅",
-        "Second target reached."
-      );
-    }
-
-    if (
-      !trade.tp3Hit &&
-      price >= signal.tp3
-    ) {
-      trade.tp3Hit = true;
-
-      showTradeEvent(
-        "TP3 HIT 🎯",
-        "Final target reached."
-      );
-    }
-
-    if (
-      price <=
-      trade.currentSL
-    ) {
-      trade.stopHit = true;
-
-      showTradeEvent(
-        "STOP LOSS HIT ❌",
-        "Trade management complete."
-      );
-    }
-  }
-
-  /*
-    SELL
-  */
-
-  if (signal.direction === "SELL") {
-    if (
-      !trade.tp1Hit &&
-      price <= signal.tp1
-    ) {
-      trade.tp1Hit = true;
-
-      if (
-        trade.currentSL >
-        signal.entry
-      ) {
-        trade.currentSL =
-          signal.entry;
-
-        trade.breakEvenMoved =
-          true;
-      }
-
-      showTradeEvent(
-        "TP1 HIT ✅",
-        "Break Even protection activated when appropriate."
-      );
-    }
-
-    if (
-      !trade.tp2Hit &&
-      price <= signal.tp2
-    ) {
-      trade.tp2Hit = true;
-
-      showTradeEvent(
-        "TP2 HIT ✅",
-        "Second target reached."
-      );
-    }
-
-    if (
-      !trade.tp3Hit &&
-      price <= signal.tp3
-    ) {
-      trade.tp3Hit = true;
-
-      showTradeEvent(
-        "TP3 HIT 🎯",
-        "Final target reached."
-      );
-    }
-
-    if (
-      price >=
-      trade.currentSL
-    ) {
-      trade.stopHit = true;
-
-      showTradeEvent(
-        "STOP LOSS HIT ❌",
-        "Trade management complete."
-      );
-    }
-  }
-}
+  const message =
+    buildSignalMessage(
+      signal
+    );
 
 
-function showTradeEvent(
-  title,
-  message
-) {
-  const box =
-    $("#explanationText") ||
-    $("#explanation");
+  console.log(
+    "PRECISION SIGNAL:",
+    message
+  );
 
-  if (box) {
-    box.textContent =
-      `${title} — ${message}`;
-  }
 
+  /* Browser notification. */
   if (
-    "Notification" in window &&
-    Notification.permission ===
-      "granted"
+    "Notification" in window
   ) {
-    try {
-      new Notification(
-        `PRECISION SNIPER AI — ${title}`,
-        {
-          body: message
-        }
-      );
-    } catch (_) {}
+
+    if (
+      Notification.permission ===
+      "granted"
+    ) {
+
+      try {
+
+        new Notification(
+          `PRECISION ${signal.signal} — ${signal.symbol}`,
+          {
+            body:
+              `TF: ${signal.timeframe} | Entry: ${formatPrice(signal.entry)} | SL: ${formatPrice(signal.sl)} | TP3: ${formatPrice(signal.tp3)}`,
+
+            tag:
+              signalKey(signal)
+          }
+        );
+
+      } catch (error) {
+
+        console.warn(
+          "Notification error:",
+          error
+        );
+      }
+
+    } else if (
+      Notification.permission ===
+      "default"
+    ) {
+
+      Notification.requestPermission()
+        .catch(
+          () => {}
+        );
+    }
   }
+
+
+  /* Optional custom alert hooks. */
+  if (
+    typeof window.onPrecisionSignal ===
+    "function"
+  ) {
+
+    try {
+
+      window.onPrecisionSignal(
+        signal
+      );
+
+    } catch (error) {
+
+      console.error(
+        error
+      );
+    }
+  }
+
+
+  /* Optional custom event for UI. */
+  window.dispatchEvent(
+    new CustomEvent(
+      "precision-signal",
+      {
+        detail:
+          signal
+      }
+    )
+  );
+
+
+  updateSignalDisplay(
+    signal
+  );
 }
 
 
 /* ============================================================
-   DASHBOARD
+   SIGNAL DISPLAY
    ============================================================ */
 
-function updateDashboard(
+function updateSignalDisplay(
   signal
 ) {
-  if (!signal) return;
+
+  if (
+    !signal
+  ) {
+    return;
+  }
+
 
   const direction =
-    signal.direction === "BUY"
-      ? "🟢 PRECISION SNIPER BUY"
-      : "🔴 PRECISION SNIPER SELL";
+    signal.signal ||
+    signal.direction;
+
 
   setText(
-    "#signal",
+    "signal",
+    direction === "BUY"
+      ? "🟢 SNIPER BUY"
+      : "🔴 SNIPER SELL"
+  );
+
+
+  setText(
+    "direction",
+    direction === "BUY"
+      ? "🟢 BUY DIRECTION"
+      : "🔴 SELL DIRECTION"
+  );
+
+
+  setText(
+    "setup",
+    "PRECISION SNIPER SETUP"
+  );
+
+
+  setText(
+    "confidence",
+    "HIGH"
+  );
+
+
+  setText(
+    "rr",
+    signal.rr || "1:3"
+  );
+
+
+  setText(
+    "entry",
+    formatPrice(
+      signal.entry
+    )
+  );
+
+
+  setText(
+    "sl",
+    formatPrice(
+      signal.sl
+    )
+  );
+
+
+  setText(
+    "tp1",
+    formatPrice(
+      signal.tp1
+    )
+  );
+
+
+  setText(
+    "tp2",
+    formatPrice(
+      signal.tp2
+    )
+  );
+
+
+  setText(
+    "tp3",
+    formatPrice(
+      signal.tp3
+    )
+  );
+
+
+  setText(
+    "swing",
+    direction === "BUY"
+      ? "Bullish Swing"
+      : "Bearish Swing"
+  );
+
+
+  setText(
+    "structure",
     direction
   );
 
-  setText(
-    "#direction",
-    signal.direction
-  );
 
   setText(
-    "#setup",
-    "SNIPER"
+    "liquidity",
+    direction === "BUY"
+      ? "Support / Swing Low"
+      : "Resistance / Swing High"
   );
 
+
   setText(
-    "#confidence",
+    "sr",
+    direction === "BUY"
+      ? formatPrice(
+          signal.support
+        )
+      : formatPrice(
+          signal.resistance
+        )
+  );
+
+
+  setText(
+    "pattern",
+    signal.pattern
+  );
+
+
+  setText(
+    "rejection",
+    signal.rejection
+      ? "Confirmed"
+      : "Not required"
+  );
+
+
+  setText(
+    "momentum",
+    signal.momentum
+      ? "Confirmed"
+      : "Waiting"
+  );
+
+
+  setText(
+    "confirmation",
     "CONFIRMED"
   );
 
-  setText(
-    "#rr",
-    signal.rr
-  );
 
   setText(
-    "#entry",
-    formatPrice(signal.entry)
-  );
-
-  setText(
-    "#sl",
-    formatPrice(signal.sl)
-  );
-
-  setText(
-    "#tp1",
-    formatPrice(signal.tp1)
-  );
-
-  setText(
-    "#tp2",
-    formatPrice(signal.tp2)
-  );
-
-  setText(
-    "#tp3",
-    formatPrice(signal.tp3)
-  );
-
-  setText(
-    "#pattern",
-    signal.direction === "BUY"
-      ? "Bullish confirmation"
-      : "Bearish confirmation"
-  );
-
-  setText(
-    "#rejection",
-    signal.support
-      ? "Support confirmed"
-      : signal.resistance
-        ? "Resistance confirmed"
-        : "Confirmed"
-  );
-
-  setText(
-    "#momentum",
-    `EMA ${CONFIG.EMA_LENGTH} aligned`
-  );
-
-  setText(
-    "#confirmation",
-    "CLOSED CANDLE CONFIRMED"
-  );
-
-  setText(
-    "#swing",
-    `${signal.swing.type} @ ${formatPrice(signal.swing.price)}`
-  );
-
-  setText(
-    "#structure",
-    signal.direction === "BUY"
-      ? "BULLISH"
-      : "BEARISH"
-  );
-
-  setText(
-    "#liquidity",
-    "Swing confirmed"
-  );
-
-  setText(
-    "#sr",
-    signal.direction === "BUY"
-      ? `Support ${formatPrice(signal.support?.price)}`
-      : `Resistance ${formatPrice(signal.resistance?.price)}`
-  );
-
-  setText(
-    "#explanationText",
+    "explanationText",
     signal.reason
   );
 
-  /*
-    Ensure chosen pair ALWAYS shows timeframe.
-  */
 
-  updateChosenPairDisplay();
-
-  window.lastAnalysis =
-    state.analysis;
-
-  window.currentAnalysis =
-    state.analysis;
-
-  window.currentSymbol =
-    signal.symbol;
-
-  window.currentTimeframe =
-    signal.timeframe;
-
-  window.currentPrice =
-    signal.entry;
-
-  window.currentSignal =
-    signal;
+  updateAnalysisChecklist(
+    signal
+  );
 }
 
 
 /* ============================================================
-   WAIT STATE
+   WAIT DISPLAY
    ============================================================ */
 
-function setWaitingState(
-  title = "WAIT",
-  reason =
-    "Waiting for a confirmed setup."
+function showWaitState(
+  result
 ) {
-  const tf =
-    getSelectedTimeframe();
-
-  const symbol =
-    state.selectedSymbol ||
-    "Market";
 
   setText(
-    "#signal",
-    "⚪ WAIT — NO CONFIRMED SETUP"
+    "signal",
+    "⚪ WAIT — NO SETUP"
   );
 
+
   setText(
-    "#direction",
+    "direction",
+    result.direction ||
+      "NEUTRAL"
+  );
+
+
+  setText(
+    "setup",
+    "NO CONFIRMED SETUP"
+  );
+
+
+  setText(
+    "confidence",
     "WAIT"
   );
 
-  setText(
-    "#setup",
-    `${symbol} • ${tf}`
-  );
 
   setText(
-    "#confidence",
+    "rr",
+    "—"
+  );
+
+
+  setText(
+    "entry",
+    result.entry
+      ? formatPrice(
+          result.entry
+        )
+      : "—"
+  );
+
+
+  setText(
+    "sl",
+    "—"
+  );
+
+
+  setText(
+    "tp1",
+    "—"
+  );
+
+
+  setText(
+    "tp2",
+    "—"
+  );
+
+
+  setText(
+    "tp3",
+    "—"
+  );
+
+
+  setText(
+    "swing",
+    result.direction ||
+      "WAIT"
+  );
+
+
+  setText(
+    "structure",
+    result.direction ||
+      "NEUTRAL"
+  );
+
+
+  setText(
+    "liquidity",
+    "Waiting"
+  );
+
+
+  setText(
+    "sr",
+    "—"
+  );
+
+
+  setText(
+    "pattern",
+    result.pattern ||
+      "WAIT"
+  );
+
+
+  setText(
+    "rejection",
+    "Waiting"
+  );
+
+
+  setText(
+    "momentum",
+    "Waiting"
+  );
+
+
+  setText(
+    "confirmation",
     "WAIT"
   );
 
-  setText(
-    "#rr",
-    "—"
-  );
 
   setText(
-    "#entry",
-    "—"
+    "explanationText",
+    result.reason ||
+      "No complete setup."
   );
 
-  setText(
-    "#sl",
-    "—"
+
+  updateAnalysisChecklist(
+    result
   );
+}
 
-  setText(
-    "#tp1",
-    "—"
-  );
 
-  setText(
-    "#tp2",
-    "—"
-  );
+/* ============================================================
+   ANALYSIS CHECKLIST
+   ============================================================ */
 
-  setText(
-    "#tp3",
-    "—"
-  );
+function updateAnalysisChecklist(
+  result
+) {
 
-  setText(
-    "#explanationText",
-    reason
-  );
+  const direction =
+    result.signal ||
+    result.direction;
 
-  setText(
-    "#confirmation",
-    "WAITING"
-  );
 
-  updateChosenPairDisplay();
+  const checks = {
 
-  window.currentTimeframe = tf;
+    swing:
+      direction === "BUY" ||
+      direction === "SELL",
+
+    structure:
+      direction === "BUY" ||
+      direction === "SELL",
+
+    sr:
+      Boolean(
+        result.support ||
+        result.resistance
+      ),
+
+    candle:
+      result.rejection ||
+      result.momentum ||
+      result.pattern
+  };
+
+
+  const mappings = [
+    [
+      "swingCheck",
+      checks.swing
+    ],
+
+    [
+      "structureCheck",
+      checks.structure
+    ],
+
+    [
+      "srCheck",
+      checks.sr
+    ],
+
+    [
+      "candleCheck",
+      checks.candle
+    ]
+  ];
+
+
+  for (
+    const [id, passed]
+    of mappings
+  ) {
+
+    const element =
+      $(id);
+
+    if (!element) continue;
+
+
+    element.textContent =
+      passed
+        ? "✓"
+        : "○";
+  }
 }
 
 
@@ -2499,532 +3656,1266 @@ function setWaitingState(
 function addSignalToHistory(
   signal
 ) {
-  const container =
-    $("#signalHistory");
-
-  if (!container) return;
-
-  const row =
-    document.createElement("div");
-
-  row.className =
-    "signal-history-item";
-
-  row.innerHTML = `
-    <strong>
-      ${signal.direction === "BUY" ? "🟢" : "🔴"}
-      ${escapeHTML(signal.direction)}
-    </strong>
-
-    <span>
-      ${escapeHTML(signal.symbol)}
-      •
-      ${escapeHTML(signal.timeframe)}
-    </span>
-
-    <span>
-      Entry:
-      ${escapeHTML(formatPrice(signal.entry))}
-    </span>
-
-    <span>
-      ${new Date(
-        signal.confirmedAt * 1000
-      ).toLocaleString()}
-    </span>
-  `;
-
-  container.prepend(row);
-}
-
-
-/* ============================================================
-   ALERTS
-   ============================================================ */
-
-function createAlertControl() {
-  if ($("#sniperAlertControl")) {
-    return;
-  }
-
-  const button =
-    document.createElement("button");
-
-  button.id =
-    "sniperAlertControl";
-
-  button.type =
-    "button";
-
-  button.textContent =
-    "🔔 Alerts ON";
-
-  button.style.margin =
-    "8px 0";
-
-  button.onclick = () => {
-    state.alertsEnabled =
-      !state.alertsEnabled;
-
-    button.textContent =
-      state.alertsEnabled
-        ? "🔔 Alerts ON"
-        : "🔕 Alerts OFF";
-
-    if (
-      state.alertsEnabled &&
-      "Notification" in window &&
-      Notification.permission ===
-        "default"
-    ) {
-      Notification.requestPermission()
-        .catch(() => {});
-    }
-  };
-
-  const header =
-    $(".connection") ||
-    $("header");
-
-  if (header?.parentElement) {
-    header.parentElement.appendChild(
-      button
-    );
-  } else {
-    document.body.prepend(button);
-  }
-}
-
-
-function sendSignalAlert(
-  signal
-) {
-  if (!state.alertsEnabled) {
-    return;
-  }
-
-  const key =
-    signalKey(signal);
-
-  /*
-    Never notify the same confirmed candle twice.
-  */
 
   if (
-    state.notifiedSignals.has(key)
+    !signal ||
+    signal.status !==
+    "SIGNAL"
   ) {
     return;
   }
 
-  state.notifiedSignals.add(key);
 
-  const title =
-    signal.direction === "BUY"
-      ? "🟢 PRECISION SNIPER BUY"
-      : "🔴 PRECISION SNIPER SELL";
+  const key =
+    signalKey(
+      signal
+    );
 
-  const message =
-    `${signal.symbol} • ${signal.timeframe}\n` +
-    `Entry: ${formatPrice(signal.entry)}\n` +
-    `SL: ${formatPrice(signal.sl)}\n` +
-    `TP1: ${formatPrice(signal.tp1)}\n` +
-    `TP2: ${formatPrice(signal.tp2)}\n` +
-    `TP3: ${formatPrice(signal.tp3)}\n` +
-    `${signal.reason}`;
+
+  if (
+    state.signalHistory.some(
+      item =>
+        signalKey(item) ===
+        key
+    )
+  ) {
+
+    return;
+  }
+
+
+  state.signalHistory.unshift(
+    signal
+  );
+
+
+  if (
+    state.signalHistory.length >
+    100
+  ) {
+
+    state.signalHistory =
+      state.signalHistory.slice(
+        0,
+        100
+      );
+  }
+
+
+  renderSignalHistory();
+}
+
+
+function renderSignalHistory() {
+
+  const container =
+    $(
+      "signalHistory"
+    );
+
+
+  if (!container) return;
+
+
+  container.innerHTML =
+    "";
+
+
+  for (
+    const signal of
+    state.signalHistory
+  ) {
+
+    const direction =
+      signal.signal ||
+      signal.direction;
+
+
+    const item =
+      document.createElement(
+        "div"
+      );
+
+
+    item.className =
+      "signal-history-item";
+
+
+    item.innerHTML =
+`
+<div>
+  <strong>
+    ${
+      direction === "BUY"
+        ? "🟢 BUY"
+        : "🔴 SELL"
+    }
+  </strong>
+  ${escapeHTML(signal.symbol)}
+  — ${escapeHTML(signal.timeframe)}
+</div>
+
+<div>
+  Entry:
+  ${escapeHTML(formatPrice(signal.entry))}
+</div>
+
+<div>
+  SL:
+  ${escapeHTML(formatPrice(signal.sl))}
+</div>
+
+<div>
+  TP1:
+  ${escapeHTML(formatPrice(signal.tp1))}
+  |
+  TP2:
+  ${escapeHTML(formatPrice(signal.tp2))}
+  |
+  TP3:
+  ${escapeHTML(formatPrice(signal.tp3))}
+</div>
+`;
+
+
+    container.appendChild(
+      item
+    );
+  }
+}
+
+
+/* ============================================================
+   TRADE MANAGEMENT
+   ============================================================ */
+
+function manageActiveTrade(
+  price
+) {
+
+  const trade =
+    state.tradeState;
+
+
+  if (
+    !trade ||
+    trade.stopped
+  ) {
+
+    return;
+  }
+
+
+  const signal =
+    trade.signal;
+
+
+  const direction =
+    signal.signal ||
+    signal.direction;
+
+
+  if (
+    direction === "BUY"
+  ) {
+
+    if (
+      !trade.tp1Hit &&
+      price >= signal.tp1
+    ) {
+
+      trade.tp1Hit = true;
+
+      trade.currentSL =
+        signal.entry;
+
+      trade.breakeven =
+        true;
+
+      notifyTradeEvent(
+        "TP1 HIT ✅",
+        signal
+      );
+    }
+
+
+    if (
+      !trade.tp2Hit &&
+      price >= signal.tp2
+    ) {
+
+      trade.tp2Hit = true;
+
+      notifyTradeEvent(
+        "TP2 HIT ✅",
+        signal
+      );
+    }
+
+
+    if (
+      !trade.tp3Hit &&
+      price >= signal.tp3
+    ) {
+
+      trade.tp3Hit = true;
+
+      notifyTradeEvent(
+        "TP3 HIT 🎯",
+        signal
+      );
+    }
+
+
+    if (
+      price <=
+      trade.currentSL
+    ) {
+
+      trade.stopped = true;
+
+      notifyTradeEvent(
+        trade.breakeven
+          ? "BREAKEVEN HIT"
+          : "STOP LOSS HIT ❌",
+        signal
+      );
+    }
+
+  } else {
+
+    if (
+      !trade.tp1Hit &&
+      price <= signal.tp1
+    ) {
+
+      trade.tp1Hit = true;
+
+      trade.currentSL =
+        signal.entry;
+
+      trade.breakeven =
+        true;
+
+      notifyTradeEvent(
+        "TP1 HIT ✅",
+        signal
+      );
+    }
+
+
+    if (
+      !trade.tp2Hit &&
+      price <= signal.tp2
+    ) {
+
+      trade.tp2Hit = true;
+
+      notifyTradeEvent(
+        "TP2 HIT ✅",
+        signal
+      );
+    }
+
+
+    if (
+      !trade.tp3Hit &&
+      price <= signal.tp3
+    ) {
+
+      trade.tp3Hit = true;
+
+      notifyTradeEvent(
+        "TP3 HIT 🎯",
+        signal
+      );
+    }
+
+
+    if (
+      price >=
+      trade.currentSL
+    ) {
+
+      trade.stopped = true;
+
+      notifyTradeEvent(
+        trade.breakeven
+          ? "BREAKEVEN HIT"
+          : "STOP LOSS HIT ❌",
+        signal
+      );
+    }
+  }
+}
+
+
+/* ============================================================
+   TRADE EVENT
+   ============================================================ */
+
+function notifyTradeEvent(
+  text,
+  signal
+) {
+
+  console.log(
+    text,
+    signal.symbol,
+    signal.timeframe
+  );
+
+
+  window.dispatchEvent(
+    new CustomEvent(
+      "precision-trade-event",
+      {
+        detail: {
+          text,
+          signal
+        }
+      }
+    )
+  );
+
 
   if (
     "Notification" in window &&
     Notification.permission ===
       "granted"
   ) {
+
     try {
+
       new Notification(
-        title,
+        `${text} — ${signal.symbol}`,
         {
-          body: message
+          body:
+            `${signal.timeframe} | Entry ${formatPrice(signal.entry)}`,
+
+          tag:
+            `${signalKey(signal)}::${text}`
         }
       );
-    } catch (_) {}
+
+    } catch (error) {
+
+      console.warn(
+        error
+      );
+    }
   }
-
-  showInAppAlert(
-    title,
-    message
-  );
-}
-
-
-function showInAppAlert(
-  title,
-  message
-) {
-  let box =
-    $("#sniperAlert");
-
-  if (!box) {
-    box =
-      document.createElement("div");
-
-    box.id =
-      "sniperAlert";
-
-    box.style.position =
-      "fixed";
-
-    box.style.right =
-      "15px";
-
-    box.style.bottom =
-      "15px";
-
-    box.style.zIndex =
-      "99999";
-
-    box.style.maxWidth =
-      "360px";
-
-    box.style.padding =
-      "15px";
-
-    box.style.borderRadius =
-      "12px";
-
-    box.style.background =
-      "rgba(0,0,0,.92)";
-
-    box.style.color =
-      "#fff";
-
-    document.body.appendChild(
-      box
-    );
-  }
-
-  box.innerHTML = `
-    <strong>
-      ${escapeHTML(title)}
-    </strong>
-
-    <div style="margin-top:8px;white-space:pre-line;">
-      ${escapeHTML(message)}
-    </div>
-  `;
-
-  box.style.display =
-    "block";
-
-  clearTimeout(
-    box._timer
-  );
-
-  box._timer =
-    setTimeout(() => {
-      box.style.display =
-        "none";
-    }, 10000);
 }
 
 
 /* ============================================================
-   PRECISION ANALYSIS
+   FULL SCANNER QUEUE
+   PAIR × TIMEFRAME
    ============================================================ */
 
-async function runPrecisionAnalysis(
-  force = false,
-  expectedGeneration = null
-) {
-  const symbol =
-    state.selectedSymbol;
+function buildScannerQueue() {
 
-  const timeframe =
-    getSelectedTimeframe();
+  const queue = [];
 
-  if (!symbol || !timeframe) {
+
+  const symbols =
+    state.symbols
+      .map(
+        item =>
+          item.symbol
+      )
+      .filter(Boolean);
+
+
+  const timeframes =
+    CONFIG.SCANNER_ALL_TIMEFRAMES
+      ? getAllTimeframes()
+      : [
+          state.selectedTimeframe
+        ];
+
+
+  for (
+    const symbol of symbols
+  ) {
+
+    for (
+      const timeframe
+      of timeframes
+    ) {
+
+      queue.push({
+        symbol,
+        timeframe
+      });
+    }
+  }
+
+
+  return queue;
+}
+
+
+/* ============================================================
+   START FULL SCANNER
+   ============================================================ */
+
+function startFullScanner() {
+
+  if (
+    !CONFIG.SCANNER_ENABLED
+  ) {
     return;
   }
 
-  /*
-    Every analysis run receives its own generation.
-    Older asynchronous analysis cannot overwrite
-    a newer timeframe selection.
-  */
 
-  const generation =
-    expectedGeneration !== null
-      ? expectedGeneration
-      : ++state.analysisGeneration;
+  if (
+    !state.connected
+  ) {
+    return;
+  }
 
-  state.analysisRunning = true;
 
-  try {
-    /*
-      EXACT selected timeframe.
-      No M5 substitution.
-    */
+  state.scannerGeneration++;
 
-    await loadTimeframeHistory(
-      symbol,
-      timeframe,
-      force
+
+  state.scannerQueue =
+    buildScannerQueue();
+
+
+  state.scannerQueueIndex =
+    0;
+
+
+  state.scannerStats.pairs =
+    state.symbols.length;
+
+
+  state.scannerStats.timeframes =
+    getAllTimeframes().length;
+
+
+  state.scannerStats.combinations =
+    state.scannerQueue.length;
+
+
+  state.scannerStats.scanned =
+    0;
+
+
+  if (
+    state.scannerRunning
+  ) {
+
+    return;
+  }
+
+
+  state.scannerRunning =
+    true;
+
+
+  runScannerWorker();
+}
+
+
+/* ============================================================
+   SCANNER WORKER
+   ============================================================ */
+
+async function runScannerWorker() {
+
+  while (
+    state.scannerRunning
+  ) {
+
+    if (
+      !state.connected
+    ) {
+
+      await sleep(
+        1000
+      );
+
+      continue;
+    }
+
+
+    if (
+      !state.scannerQueue.length
+    ) {
+
+      state.scannerQueue =
+        buildScannerQueue();
+
+      state.scannerQueueIndex =
+        0;
+    }
+
+
+    const generation =
+      state.scannerGeneration;
+
+
+    const batch =
+      state.scannerQueue.slice(
+        state.scannerQueueIndex,
+        state.scannerQueueIndex +
+          CONFIG.SCANNER_BATCH_SIZE
+      );
+
+
+    if (
+      !batch.length
+    ) {
+
+      state.scannerQueue =
+        buildScannerQueue();
+
+      state.scannerQueueIndex =
+        0;
+
+      state.scannerStats.lastRun =
+        new Date().toISOString();
+
+      await sleep(
+        CONFIG.SCANNER_DELAY
+      );
+
+      continue;
+    }
+
+
+    for (
+      const item of batch
+    ) {
+
+      if (
+        generation !==
+        state.scannerGeneration
+      ) {
+
+        break;
+      }
+
+
+      await scanSingleMarket(
+        item.symbol,
+        item.timeframe
+      );
+
+
+      state.scannerStats.scanned++;
+
+
+      await sleep(
+        CONFIG.SCANNER_DELAY
+      );
+    }
+
+
+    state.scannerQueueIndex +=
+      batch.length;
+
+
+    if (
+      state.scannerQueueIndex >=
+      state.scannerQueue.length
+    ) {
+
+      state.scannerQueue =
+        buildScannerQueue();
+
+      state.scannerQueueIndex =
+        0;
+
+      state.scannerStats.lastRun =
+        new Date().toISOString();
+    }
+  }
+}
+
+
+/* ============================================================
+   SCAN ONE PAIR + TIMEFRAME
+   ============================================================ */
+
+async function scanSingleMarket(
+  symbol,
+  timeframe
+) {
+
+  const tf =
+    normalizeTimeframe(
+      timeframe
     );
 
-    if (
-      generation !==
-      state.analysisGeneration
-    ) {
-      return;
-    }
+
+  const context =
+    scannerContextKey(
+      symbol,
+      tf
+    );
+
+
+  try {
 
     const candles =
-      getClosedCandles(
+      await loadTimeframeHistory(
         symbol,
-        timeframe
+        tf,
+        false
       );
 
+
     if (
+      !candles ||
       candles.length < 100
     ) {
-      setWaitingState(
-        "WAIT",
-        `Waiting for more closed ${timeframe} candles.`
-      );
 
       return;
     }
 
-    /*
-      The execution timeframe is the
-      timeframe selected by the user.
-    */
+
+    const closed =
+      getClosedCandles(
+        candles,
+        tf
+      );
+
+
+    if (
+      closed.length < 100
+    ) {
+
+      return;
+    }
+
+
+    const latestClosed =
+      closed[
+        closed.length - 1
+      ];
+
+
+    const latestEpoch =
+      Number(
+        latestClosed.epoch
+      );
+
+
+    if (
+      !latestEpoch
+    ) {
+
+      return;
+    }
+
+
+    /* ========================================================
+       FIRST OBSERVATION
+       ======================================================== */
+
+    if (
+      !state.scannerInitialized[
+        context
+      ]
+    ) {
+
+      state.scannerInitialized[
+        context
+      ] = true;
+
+
+      state.scannerLastClosedCandle[
+        context
+      ] =
+        latestEpoch;
+
+
+      /*
+       IMPORTANT:
+       Do not alert on historical setup during
+       initial baseline.
+      */
+
+      const baseline =
+        generateSniperSignal(
+          symbol,
+          tf,
+          closed
+        );
+
+
+      if (
+        baseline.status ===
+        "SIGNAL"
+      ) {
+
+        state.scannerSignals[
+          context
+        ] = baseline;
+
+
+        state.scannerSeenSignals.add(
+          scannerSignalKey(
+            baseline
+          )
+        );
+      }
+
+
+      return;
+    }
+
+
+    /* ========================================================
+       SAME CLOSED CANDLE
+       ======================================================== */
+
+    if (
+      state.scannerLastClosedCandle[
+        context
+      ] === latestEpoch
+    ) {
+
+      return;
+    }
+
+
+    /* ========================================================
+       NEW CLOSED CANDLE
+       ======================================================== */
+
+    state.scannerLastClosedCandle[
+      context
+    ] =
+      latestEpoch;
+
 
     const signal =
       generateSniperSignal(
         symbol,
-        timeframe,
-        candles
+        tf,
+        closed
       );
+
+
+    state.scannerSignals[
+      context
+    ] =
+      signal;
+
+
+    if (
+      signal.status !==
+      "SIGNAL"
+    ) {
+
+      return;
+    }
+
+
+    const isNew =
+      isNewScannerSignal(
+        signal
+      );
+
+
+    if (!isNew) {
+
+      return;
+    }
+
+
+    /*
+     Only new confirmed signal is alerted.
+    */
+
+    sendBackgroundSignalAlert(
+      signal
+    );
+
+
+    state.scannerStats.signals++;
+
+
+  } catch (error) {
+
+    console.warn(
+      `Scanner error ${symbol} ${tf}:`,
+      error.message ||
+      error
+    );
+  }
+}
+
+
+/* ============================================================
+   FORCE SCAN ONE PAIR + TIMEFRAME
+   ============================================================ */
+
+async function forceScan(
+  symbol,
+  timeframe
+) {
+
+  const tf =
+    normalizeTimeframe(
+      timeframe
+    );
+
+
+  const context =
+    scannerContextKey(
+      symbol,
+      tf
+    );
+
+
+  try {
+
+    const candles =
+      await loadTimeframeHistory(
+        symbol,
+        tf,
+        true
+      );
+
+
+    const closed =
+      getClosedCandles(
+        candles,
+        tf
+      );
+
+
+    if (
+      closed.length < 100
+    ) {
+
+      return null;
+    }
+
+
+    const signal =
+      generateSniperSignal(
+        symbol,
+        tf,
+        closed
+      );
+
+
+    state.scannerInitialized[
+      context
+    ] = true;
+
+
+    state.scannerLastClosedCandle[
+      context
+    ] =
+      closed[
+        closed.length - 1
+      ].epoch;
+
+
+    return signal;
+
+  } catch (error) {
+
+    console.error(
+      "Force scan error:",
+      error
+    );
+
+    return null;
+  }
+}
+
+
+/* ============================================================
+   SELECTED PAIR ANALYSIS
+   ============================================================ */
+
+async function runPrecisionAnalysis(
+  force = false
+) {
+
+  const symbol =
+    state.selectedSymbol;
+
+
+  const timeframe =
+    state.selectedTimeframe;
+
+
+  if (
+    !symbol ||
+    !timeframe
+  ) {
+
+    return;
+  }
+
+
+  const generation =
+    state.analysisGeneration;
+
+
+  if (
+    state.analysisRunning
+  ) {
+
+    return;
+  }
+
+
+  state.analysisRunning =
+    true;
+
+
+  try {
+
+    const candles =
+      await loadTimeframeHistory(
+        symbol,
+        timeframe,
+        force
+      );
+
 
     if (
       generation !==
       state.analysisGeneration
     ) {
+
       return;
     }
 
-    /*
-      Save exact selected analysis.
-    */
 
-    state.analysis = {
-      symbol,
-      timeframe,
+    const closed =
+      getClosedCandles(
+        candles,
+        timeframe
+      );
 
-      executionTimeframe:
+
+    if (
+      closed.length < 100
+    ) {
+
+      showWaitState({
+        direction:
+          "NEUTRAL",
+
+        reason:
+          "Waiting for enough closed market data."
+      });
+
+      return;
+    }
+
+
+    const result =
+      generateSniperSignal(
+        symbol,
         timeframe,
+        closed
+      );
 
-      candles,
 
-      signal,
+    state.analysis =
+      result;
 
-      lastClosedCandle:
-        candles[
-          candles.length - 1
-        ],
-
-      updatedAt:
-        Date.now()
-    };
-
-    /*
-      Expose exact data to the
-      Question Bar and chart.
-    */
-
-    window.lastAnalysis =
-      state.analysis;
-
-    window.currentAnalysis =
-      state.analysis;
-
-    window.closedCandles =
-      candles;
-
-    window.currentCandles =
-      candles;
-
-    window.currentSymbol =
-      symbol;
 
     window.currentTimeframe =
       timeframe;
 
-    window.currentPrice =
-      state.livePrice;
+    window.closedCandles =
+      closed;
 
-    /*
-      Dispatch event so existing charts
-      can update without being removed.
-    */
+    window.currentAnalysis =
+      result;
 
-    try {
-      window.dispatchEvent(
-        new CustomEvent(
-          "precision-analysis",
-          {
-            detail:
-              state.analysis
-          }
-        )
-      );
-    } catch (_) {}
-
-    /*
-      Only a CONFIRMED sniper signal
-      reaches processSignal().
-    */
 
     if (
-      signal.status === "SNIPER"
+      result.status ===
+      "SIGNAL"
     ) {
-      processSignal(signal);
-    } else {
+
       /*
-        No new confirmed signal.
-        Do not invent one.
+       Selected analyzer should display the signal,
+       but background scanner remains independent.
       */
 
-      if (
-        !state.activeSignal ||
-        state.activeSignal.timeframe !==
-          timeframe
-      ) {
-        setWaitingState(
-          "WAIT",
-          signal.reason ||
-            "Waiting for a new swing and candle confirmation."
-        );
-      }
+      state.activeSignal =
+        result;
+
+      updateSignalDisplay(
+        result
+      );
+
+      updateTradeState(
+        result
+      );
+
+    } else {
+
+      showWaitState(
+        result
+      );
     }
 
-    updateChosenPairDisplay();
+
+    window.dispatchEvent(
+      new CustomEvent(
+        "precision-analysis",
+        {
+          detail:
+            result
+        }
+      )
+    );
+
 
   } catch (error) {
+
     console.error(
       "Precision analysis error:",
       error
     );
 
-    if (
-      generation ===
-      state.analysisGeneration
-    ) {
-      setWaitingState(
-        "WAIT",
-        "Waiting for live confirmed market data."
-      );
-    }
+
+    showWaitState({
+      direction:
+        "ERROR",
+
+      reason:
+        "Unable to retrieve live market data."
+    });
+
   } finally {
-    if (
-      generation ===
-      state.analysisGeneration
-    ) {
-      state.analysisRunning =
-        false;
-    }
+
+    state.analysisRunning =
+      false;
   }
 }
 
 
 /* ============================================================
-   TIMEFRAME CHANGE
+   UPDATE SELECTED TRADE STATE
+   ============================================================ */
+
+function updateTradeState(
+  signal
+) {
+
+  if (
+    !signal ||
+    signal.status !==
+    "SIGNAL"
+  ) {
+
+    return;
+  }
+
+
+  const existing =
+    state.tradeState;
+
+
+  if (
+    existing &&
+    signalKey(
+      existing.signal
+    ) ===
+    signalKey(signal)
+  ) {
+
+    return;
+  }
+
+
+  state.tradeState = {
+
+    signal,
+
+    tp1Hit: false,
+
+    tp2Hit: false,
+
+    tp3Hit: false,
+
+    stopped: false,
+
+    breakeven: false,
+
+    currentSL:
+      signal.sl
+  };
+}
+
+
+/* ============================================================
+   SELECT TIMEFRAME
    ============================================================ */
 
 async function selectTimeframe(
   timeframe
 ) {
-  timeframe =
-    normalizeTimeframe(timeframe);
 
-  if (!timeframe) {
-    return;
-  }
+  const tf =
+    normalizeTimeframe(
+      timeframe
+    );
 
-  /*
-    INVALIDATE ALL OLD ASYNC ANALYSIS.
-  */
-
-  const generation =
-    ++state.analysisGeneration;
-
-  /*
-    THIS IS THE IMPORTANT FIX:
-    selectedTimeframe is changed FIRST.
-  */
 
   state.selectedTimeframe =
-    timeframe;
+    tf;
 
-  /*
-    Never carry an old M5/H1/etc signal
-    into the new timeframe.
-  */
+
+  state.analysisGeneration++;
+
 
   state.activeSignal =
     null;
 
+
   state.tradeState =
     null;
+
 
   state.analysis =
     null;
 
-  updateTimeframeButtons();
 
-  updateChosenPairDisplay();
+  const generation =
+    state.analysisGeneration;
 
-  setWaitingState(
-    "LOADING",
-    `Loading ${state.selectedSymbol} ${timeframe} candles...`
-  );
-
-  if (!state.selectedSymbol) {
-    return;
-  }
 
   try {
-    await loadTimeframeHistory(
-      state.selectedSymbol,
-      timeframe,
-      true
-    );
+
+    const candles =
+      await loadTimeframeHistory(
+        state.selectedSymbol,
+        tf,
+        true
+      );
+
 
     if (
       generation !==
       state.analysisGeneration
     ) {
+
       return;
     }
 
-    await runPrecisionAnalysis(
-      false,
-      generation
-    );
 
-  } catch (error) {
-    console.error(
-      "Timeframe change error:",
-      error
-    );
+    const closed =
+      getClosedCandles(
+        candles,
+        tf
+      );
+
+
+    const result =
+      generateSniperSignal(
+        state.selectedSymbol,
+        tf,
+        closed
+      );
+
+
+    state.analysis =
+      result;
+
 
     if (
-      generation ===
-      state.analysisGeneration
+      result.status ===
+      "SIGNAL"
     ) {
-      setWaitingState(
-        "WAIT",
-        `Waiting for ${timeframe} confirmed candles.`
+
+      updateSignalDisplay(
+        result
+      );
+
+      updateTradeState(
+        result
+      );
+
+    } else {
+
+      showWaitState(
+        result
       );
     }
+
+
+  } catch (error) {
+
+    console.error(
+      "Timeframe selection error:",
+      error
+    );
+  }
+}
+
+
+/* ============================================================
+   ANALYSIS LOOP
+   ============================================================ */
+
+function startAnalysisLoop() {
+
+  setInterval(
+    () => {
+
+      if (
+        state.selectedSymbol
+      ) {
+
+        runPrecisionAnalysis(
+          false
+        );
+      }
+
+    },
+    CONFIG.ANALYSIS_INTERVAL
+  );
+}
+
+
+/* ============================================================
+   REQUEST NOTIFICATION PERMISSION
+   ============================================================ */
+
+async function enableNotifications() {
+
+  if (
+    !("Notification" in window)
+  ) {
+
+    return;
+  }
+
+
+  try {
+
+    const permission =
+      await Notification.requestPermission();
+
+
+    state.alertsEnabled =
+      permission ===
+      "granted";
+
+
+  } catch (error) {
+
+    console.warn(
+      error
+    );
   }
 }
 
@@ -3033,512 +4924,456 @@ async function selectTimeframe(
    AI QUESTION BAR
    ============================================================ */
 
-function createQuestionBar() {
-  /*
-    Do not create a duplicate if HTML already
-    contains an AI question bar.
-  */
+function setupQuestionBar() {
+
+  const input =
+    $(
+      "questionInput"
+    );
+
+
+  const button =
+    $(
+      "questionButton"
+    );
+
+
+  const answer =
+    $(
+      "questionAnswer"
+    );
+
 
   if (
-    $("#aiQuestion") ||
-    $("#questionInput") ||
-    $("#aiQuestionInput")
+    !input ||
+    !button
   ) {
+
     return;
   }
 
-  const wrapper =
-    document.createElement("div");
 
-  wrapper.id =
-    "sniperQuestionBar";
+  function answerQuestion() {
 
-  wrapper.style.margin =
-    "15px 0";
-
-  wrapper.innerHTML = `
-    <div style="display:flex;gap:8px;flex-wrap:wrap;">
-      <input
-        id="sniperQuestionInput"
-        type="text"
-        placeholder="Ask about this market..."
-        style="flex:1;min-width:220px;"
-      />
-
-      <button
-        id="sniperQuestionButton"
-        type="button"
-      >
-        Ask AI
-      </button>
-    </div>
-
-    <div
-      id="aiAnswer"
-      style="margin-top:10px;white-space:pre-wrap;"
-    >
-      Ask me about the current market.
-    </div>
-  `;
-
-  const history =
-    $("#signalHistory");
-
-  if (
-    history?.parentElement
-  ) {
-    history.parentElement.insertBefore(
-      wrapper,
-      history
-    );
-  } else {
-    document.body.appendChild(
-      wrapper
-    );
-  }
-
-  $("#sniperQuestionButton")
-    ?.addEventListener(
-      "click",
-      () => {
-        askSuccessfulAI(
-          $("#sniperQuestionInput")
-            ?.value
-        );
-      }
-    );
-
-  $("#sniperQuestionInput")
-    ?.addEventListener(
-      "keydown",
-      event => {
-        if (
-          event.key === "Enter"
-        ) {
-          askSuccessfulAI(
-            event.target.value
-          );
-        }
-      }
-    );
-}
+    const question =
+      input.value
+        .trim()
+        .toLowerCase();
 
 
-/* ============================================================
-   AI QUESTION
-   ============================================================ */
+    if (!question) {
+      return;
+    }
 
-async function askSuccessfulAI(
-  question
-) {
-  question =
-    String(
-      question || ""
-    ).trim();
 
-  if (!question) {
-    return;
-  }
+    let response =
+      "Ask me about the current market structure, signal, entry, SL, TP, timeframe, support/resistance, candle confirmation or why the bot is waiting.";
 
-  const answerBox =
-    $("#aiAnswer") ||
-    $("#answer");
 
-  if (answerBox) {
-    answerBox.textContent =
-      "Analyzing the selected market and timeframe...";
-  }
+    const analysis =
+      state.analysis;
 
-  const symbol =
-    state.selectedSymbol;
 
-  const timeframe =
-    getSelectedTimeframe();
+    if (
+      !analysis
+    ) {
 
-  const candles =
-    getClosedCandles(
-      symbol,
-      timeframe
-    );
+      response =
+        "The bot is still loading live market data.";
 
-  const analysis =
-    state.analysis || {};
+    } else if (
+      question.includes(
+        "why"
+      ) &&
+      question.includes(
+        "buy"
+      )
+    ) {
 
-  const market = {
-    symbol,
+      response =
+        analysis.status ===
+        "SIGNAL" &&
+        (
+          analysis.signal ||
+          analysis.direction
+        ) ===
+        "BUY"
 
-    name:
-      getSelectedMarketName(),
+          ? analysis.reason
 
-    price:
-      state.livePrice,
+          : "There is currently no confirmed BUY setup.";
 
-    timeframe,
+    } else if (
+      question.includes(
+        "why"
+      ) &&
+      question.includes(
+        "sell"
+      )
+    ) {
 
-    granularity:
-      CONFIG.TIMEFRAMES[timeframe]
-  };
+      response =
+        analysis.status ===
+        "SIGNAL" &&
+        (
+          analysis.signal ||
+          analysis.direction
+        ) ===
+        "SELL"
 
-  try {
-    const response =
-      await fetch(
-        "/api/ask",
+          ? analysis.reason
+
+          : "There is currently no confirmed SELL setup.";
+
+    } else if (
+      question.includes(
+        "entry"
+      )
+    ) {
+
+      response =
+        analysis.entry
+          ? `Current confirmed entry: ${formatPrice(analysis.entry)}`
+          : "There is no confirmed entry.";
+
+    } else if (
+      question.includes(
+        "stop"
+      ) ||
+      question.includes(
+        "sl"
+      )
+    ) {
+
+      response =
+        analysis.sl
+          ? `Current stop loss: ${formatPrice(analysis.sl)}`
+          : "There is no confirmed stop loss.";
+
+    } else if (
+      question.includes(
+        "tp"
+      ) ||
+      question.includes(
+        "take profit"
+      )
+    ) {
+
+      response =
+        analysis.tp1
+          ? `TP1: ${formatPrice(analysis.tp1)}, TP2: ${formatPrice(analysis.tp2)}, TP3: ${formatPrice(analysis.tp3)}`
+          : "There are no confirmed take-profit levels.";
+
+    } else if (
+      question.includes(
+        "why"
+      ) ||
+      question.includes(
+        "wait"
+      )
+    ) {
+
+      response =
+        analysis.reason ||
+        "The bot is waiting for complete confirmation.";
+
+    } else if (
+      question.includes(
+        "timeframe"
+      )
+    ) {
+
+      response =
+        `Current timeframe: ${state.selectedTimeframe}`;
+
+    } else if (
+      question.includes(
+        "market"
+      ) ||
+      question.includes(
+        "pair"
+      )
+    ) {
+
+      response =
+        `Current market: ${state.selectedSymbol}`;
+
+    }
+
+
+    if (answer) {
+
+      answer.textContent =
+        response;
+    }
+
+
+    window.dispatchEvent(
+      new CustomEvent(
+        "precision-question-answer",
         {
-          method: "POST",
-
-          headers: {
-            "Content-Type":
-              "application/json"
-          },
-
-          body:
-            JSON.stringify({
-              question,
-
-              market,
-
-              timeframe,
-
-              analysis,
-
-              candles
-            })
+          detail: {
+            question,
+            answer:
+              response
+          }
         }
-      );
-
-    const data =
-      await response.json();
-
-    if (!response.ok) {
-      throw new Error(
-        data.error ||
-        "AI request failed."
-      );
-    }
-
-    const answer =
-      data.answer ||
-      data.fallback ||
-      "No answer returned.";
-
-    if (answerBox) {
-      answerBox.textContent =
-        answer;
-    }
-
-    window.lastAIAnswer =
-      answer;
-
-    return answer;
-
-  } catch (error) {
-    console.error(
-      "AI Question error:",
-      error
-    );
-
-    const fallback =
-      buildLocalAIAnswer(
-        question,
-        analysis,
-        timeframe
-      );
-
-    if (answerBox) {
-      answerBox.textContent =
-        fallback;
-    }
-
-    return fallback;
-  }
-}
-
-
-/* ============================================================
-   LOCAL AI FALLBACK
-   ============================================================ */
-
-function buildLocalAIAnswer(
-  question,
-  analysis,
-  timeframe
-) {
-  const signal =
-    analysis?.signal;
-
-  if (!signal) {
-    return (
-      `Current timeframe: ${timeframe}\n\n` +
-      "There is no confirmed sniper setup right now. " +
-      "The strategy is waiting for a confirmed swing and candle confirmation."
+      )
     );
   }
 
-  if (
-    signal.status === "SNIPER"
-  ) {
-    return (
-      `${signal.direction === "BUY" ? "🟢 BUY" : "🔴 SELL"} ` +
-      `confirmed on ${signal.symbol} ${signal.timeframe}.\n\n` +
 
-      `Entry: ${formatPrice(signal.entry)}\n` +
-      `SL: ${formatPrice(signal.sl)}\n` +
-      `TP1: ${formatPrice(signal.tp1)}\n` +
-      `TP2: ${formatPrice(signal.tp2)}\n` +
-      `TP3: ${formatPrice(signal.tp3)}\n\n` +
+  button.addEventListener(
+    "click",
+    answerQuestion
+  );
 
-      `Reason: ${signal.reason}`
-    );
-  }
 
-  return (
-    `WAIT on ${signal.symbol} ${signal.timeframe}.\n\n` +
-    signal.reason
+  input.addEventListener(
+    "keydown",
+    event => {
+
+      if (
+        event.key ===
+        "Enter"
+      ) {
+
+        answerQuestion();
+      }
+    }
   );
 }
 
 
 /* ============================================================
-   INITIAL UI
+   SELECTOR EVENTS
    ============================================================ */
 
-function initializeExistingUI() {
-  /*
-    Detect currently selected timeframe.
-  */
+function setupUI() {
 
-  let initialTF = null;
+  const market =
+    $("market");
 
-  const activeButton =
-    document.querySelector(
-      "[data-timeframe].active"
-    );
 
-  if (activeButton) {
-    initialTF =
-      normalizeTimeframe(
-        activeButton.dataset.timeframe ||
-        activeButton.value ||
-        activeButton.textContent
-      );
-  }
+  if (market) {
 
-  const timeframeSelect =
-    $("#timeframe");
-
-  if (
-    !initialTF &&
-    timeframeSelect
-  ) {
-    initialTF =
-      normalizeTimeframe(
-        timeframeSelect.value
-      );
-  }
-
-  /*
-    Only use M5 as initial default.
-    It is NOT used as a fallback for
-    another selected timeframe.
-  */
-
-  state.selectedTimeframe =
-    initialTF ||
-    "M5";
-
-  updateTimeframeButtons();
-  updateChosenPairDisplay();
-
-  /*
-    Market selector.
-  */
-
-  $("#market")
-    ?.addEventListener(
+    market.addEventListener(
       "change",
       event => {
+
         selectMarket(
           event.target.value
         );
       }
     );
+  }
 
-  /*
-    Robust event delegation:
-    works even if timeframe buttons
-    are dynamically created.
-  */
 
-  document.addEventListener(
-    "click",
-    event => {
-      const button =
-        event.target.closest(
-          "[data-timeframe]"
+  const analyze =
+    $("analyze") ||
+    $("analyzeBtn") ||
+    $("analyzeButton");
+
+
+  if (analyze) {
+
+    analyze.addEventListener(
+      "click",
+      () => {
+
+        runPrecisionAnalysis(
+          true
         );
-
-      if (!button) {
-        return;
-      }
-
-      event.preventDefault();
-
-      const tf =
-        normalizeTimeframe(
-          button.dataset.timeframe ||
-          button.value ||
-          button.textContent
-        );
-
-      if (tf) {
-        selectTimeframe(tf);
-      }
-    }
-  );
-
-  /*
-    Optional timeframe select.
-  */
-
-  timeframeSelect
-    ?.addEventListener(
-      "change",
-      event => {
-        const tf =
-          normalizeTimeframe(
-            event.target.value
-          );
-
-        if (tf) {
-          selectTimeframe(tf);
-        }
       }
     );
+  }
 
-  /*
-    Existing Analyze buttons.
-  */
 
-  const analyzeButtons = [
-    "#analyze",
-    "#analyzeBtn",
-    "#analyzeButton"
-  ];
+  const timeframeButtons =
+    $all(
+      "[data-timeframe]"
+    );
 
-  analyzeButtons.forEach(
-    selector => {
-      $(selector)
-        ?.addEventListener(
-          "click",
-          () => {
-            runPrecisionAnalysis(
-              true
-            );
-          }
+
+  for (
+    const button of
+    timeframeButtons
+  ) {
+
+    button.addEventListener(
+      "click",
+      () => {
+
+        selectTimeframe(
+          button.dataset.timeframe
         );
-    }
+      }
+    );
+  }
+
+
+  const notifyButton =
+    $(
+      "enableNotifications"
+    );
+
+
+  if (notifyButton) {
+
+    notifyButton.addEventListener(
+      "click",
+      enableNotifications
+    );
+  }
+}
+
+
+/* ============================================================
+   SCANNER STATUS EXPORT
+   ============================================================ */
+
+function getScannerStatus() {
+
+  return {
+
+    enabled:
+      CONFIG.SCANNER_ENABLED,
+
+    running:
+      state.scannerRunning,
+
+    connected:
+      state.connected,
+
+    pairs:
+      state.scannerStats.pairs,
+
+    timeframes:
+      state.scannerStats.timeframes,
+
+    combinations:
+      state.scannerStats.combinations,
+
+    scanned:
+      state.scannerStats.scanned,
+
+    signals:
+      state.scannerStats.signals,
+
+    lastRun:
+      state.scannerStats.lastRun
+  };
+}
+
+
+/* ============================================================
+   PUBLIC DEBUG / API
+   ============================================================ */
+
+window.SuccessfulPineScript = {
+
+  state,
+
+  CONFIG,
+
+  connect:
+    connectDeriv,
+
+  analyze:
+    runPrecisionAnalysis,
+
+  scan:
+    startFullScanner,
+
+  scanMarket:
+    forceScan,
+
+  selectMarket,
+
+  selectTimeframe,
+
+  generateSignal:
+    generateSniperSignal,
+
+  scannerStatus:
+    getScannerStatus,
+
+  requestNotifications:
+    enableNotifications
+};
+
+
+/* ============================================================
+   INITIALIZATION
+   ============================================================ */
+
+async function initialize() {
+
+  if (
+    state.initialized
+  ) {
+
+    return;
+  }
+
+
+  state.initialized =
+    true;
+
+
+  setConnectionStatus(
+    "Connecting...",
+    false
   );
+
+
+  setupUI();
+
+  setupQuestionBar();
+
+
+  connectDeriv();
+
+
+  startAnalysisLoop();
+
 
   /*
-    Initial WAIT state.
+   Give the WebSocket time to obtain active symbols.
   */
 
-  setWaitingState(
-    "WAIT",
-    "Waiting for live market data and a confirmed swing."
-  );
-}
-
-
-/* ============================================================
-   UTILITIES
-   ============================================================ */
-
-function formatPrice(
-  value
-) {
-  if (
-    value === null ||
-    value === undefined ||
-    !Number.isFinite(
-      Number(value)
-    )
-  ) {
-    return "—";
-  }
-
-  const number =
-    Number(value);
-
-  const absolute =
-    Math.abs(number);
-
-  let decimals = 2;
-
-  if (
-    absolute >= 1000
-  ) {
-    decimals = 2;
-  } else if (
-    absolute >= 100
-  ) {
-    decimals = 2;
-  } else if (
-    absolute >= 1
-  ) {
-    decimals = 3;
-  } else {
-    decimals = 5;
-  }
-
-  return number.toFixed(
-    decimals
-  );
-}
-
-
-/* ============================================================
-   NOTIFICATION PERMISSION
-   ============================================================ */
-
-function requestNotificationPermission() {
-  if (
-    "Notification" in window &&
-    Notification.permission ===
-      "default"
-  ) {
-    Notification.requestPermission()
-      .catch(() => {});
-  }
-}
-
-
-/* ============================================================
-   PERIODIC ANALYSIS
-   ============================================================ */
-
-function startAnalysisLoop() {
-  setInterval(
+  setTimeout(
     () => {
-      /*
-        Only analyze when a selected market exists.
-      */
 
       if (
-        !state.selectedSymbol
+        state.connected &&
+        state.symbols.length
       ) {
-        return;
+
+        if (
+          !state.selectedSymbol
+        ) {
+
+          state.selectedSymbol =
+            state.symbols[0].symbol;
+        }
+
+
+        subscribeToTick(
+          state.selectedSymbol
+        );
+
+
+        runPrecisionAnalysis(
+          true
+        );
+
+
+        startFullScanner();
       }
 
-      /*
-        Use the EXACT selected timeframe.
-      */
-
-      runPrecisionAnalysis(
-        false
-      );
     },
-    CONFIG.ANALYSIS_INTERVAL
+    2500
   );
 }
 
@@ -3547,84 +5382,17 @@ function startAnalysisLoop() {
    START APPLICATION
    ============================================================ */
 
-document.addEventListener(
-  "DOMContentLoaded",
-  () => {
-    if (state.initialized) {
-      return;
-    }
+if (
+  document.readyState ===
+  "loading"
+) {
 
-    state.initialized =
-      true;
+  document.addEventListener(
+    "DOMContentLoaded",
+    initialize
+  );
 
-    initializeExistingUI();
+} else {
 
-    createQuestionBar();
-
-    createAlertControl();
-
-    requestNotificationPermission();
-
-    connectDeriv();
-
-    startAnalysisLoop();
-
-    /*
-      Public API for existing app components.
-    */
-
-    window.SuccessfulPrecisionAI = {
-      state,
-
-      CONFIG,
-
-      connectDeriv,
-
-      selectMarket,
-
-      selectTimeframe,
-
-      runPrecisionAnalysis,
-
-      askSuccessfulAI,
-
-      getClosedCandles,
-
-      detectSwings,
-
-      determineDirection,
-
-      generateSniperSignal
-    };
-
-    /*
-      Useful globals for existing charts
-      and other frontend components.
-    */
-
-    window.askSuccessfulAI =
-      askSuccessfulAI;
-
-    window.selectTimeframe =
-      selectTimeframe;
-
-    window.selectMarket =
-      selectMarket;
-
-    window.runPrecisionAnalysis =
-      runPrecisionAnalysis;
-
-    window.currentTimeframe =
-      state.selectedTimeframe;
-  }
-);
-
-
-/* ============================================================
-   FINAL GLOBALS
-   ============================================================ */
-
-window.PrecisionSniperAI = {
-  CONFIG,
-  state
-};
+  initialize();
+}
