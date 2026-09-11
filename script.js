@@ -3215,3 +3215,155 @@ window.SuccessfulPrecisionAI = {
 /* ============================================================
    END
    ============================================================ */
+
+// ============================================================
+// SUCCESSFUL PINE SCRIPT — AI QUESTION BAR CONNECTION
+// ============================================================
+
+async function askSuccessfulAI(question) {
+  question = String(question || "").trim();
+
+  if (!question) return;
+
+  const answerBox =
+    document.getElementById("aiAnswer") ||
+    document.getElementById("answer");
+
+  if (answerBox) {
+    answerBox.textContent = "Analyzing the live market data...";
+  }
+
+  // Use the latest analysis already produced by the bot
+  const analysis =
+    window.lastAnalysis ||
+    window.currentAnalysis ||
+    {};
+
+  // Use the latest closed candles if available
+  const candles =
+    window.closedCandles ||
+    window.currentCandles ||
+    [];
+
+  const marketSelect =
+    document.getElementById("market");
+
+  const market = {
+    symbol:
+      marketSelect?.value ||
+      window.currentSymbol ||
+      "Unknown",
+
+    name:
+      marketSelect?.selectedOptions?.[0]?.textContent ||
+      "",
+
+    price:
+      window.currentPrice ??
+      null
+  };
+
+  try {
+    const response = await fetch("/api/ask", {
+      method: "POST",
+
+      headers: {
+        "Content-Type": "application/json"
+      },
+
+      body: JSON.stringify({
+        question,
+        market,
+        analysis,
+        candles
+      })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        data.error || "AI request failed"
+      );
+    }
+
+    const answer =
+      data.answer ||
+      data.fallback ||
+      "No answer returned.";
+
+    if (answerBox) {
+      answerBox.textContent = answer;
+    }
+
+    // Also expose the answer for other UI components
+    window.lastAIAnswer = answer;
+
+    return answer;
+
+  } catch (error) {
+
+    console.error(
+      "Question Bar Error:",
+      error
+    );
+
+    if (answerBox) {
+      answerBox.textContent =
+        "Unable to connect to the AI assistant right now. Please try again.";
+    }
+  }
+}
+
+
+// ------------------------------------------------------------
+// Connect existing Question Bar
+// ------------------------------------------------------------
+
+document.addEventListener(
+  "DOMContentLoaded",
+  () => {
+
+    const input =
+      document.getElementById("aiQuestion");
+
+    const button =
+      document.getElementById("askAI");
+
+    if (!input || !button) {
+      console.warn(
+        "AI Question Bar elements not found."
+      );
+      return;
+    }
+
+    button.addEventListener(
+      "click",
+      () => {
+        askSuccessfulAI(input.value);
+      }
+    );
+
+    input.addEventListener(
+      "keydown",
+      (event) => {
+
+        if (event.key === "Enter") {
+          event.preventDefault();
+
+          askSuccessfulAI(
+            input.value
+          );
+        }
+      }
+    );
+  }
+);
+
+
+// ------------------------------------------------------------
+// Make function available globally
+// ------------------------------------------------------------
+
+window.askSuccessfulAI =
+  askSuccessfulAI;
